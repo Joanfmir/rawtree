@@ -89,4 +89,13 @@ def _v2(version: str, rebuy: bool) -> FeatureSchema:
 V2 = _v2("v2", rebuy=True)
 V2_NOREBUY = _v2("v2_norebuy", rebuy=False)
 
-SCHEMAS = {s.version: s for s in (V1, V2, V2_NOREBUY)}
+# ── v3_rank: dataset del ordenador (segunda etapa). Ver reco/bird/stage2.py y scripts/bird_stage2.py ──
+STAGE2_LIST = ("s1_prob", "s1_rank", "s1_rel", "s1_z", "rel_price", "rel_pop", "rel_affinity", "rel_cvr",
+               "set_same_sub", "set_same_brand", "sub_rank", "set_same_cat", "set_top_prob", "set_spread")
+STAGE2_DIRECT = ("u_attr_share", "sv_attr_share", "recently_viewed", "sv_recency", "view_to_purchase_score",
+                 "it_c_cvr", "it_trend", "u_logp_diff", "is_new_user", "page")
+V3_RANK = FeatureSchema(version="v3_rank", features=STAGE2_LIST + STAGE2_DIRECT + ("position",),
+                        categorical=("page",), per_request=STAGE2_LIST + STAGE2_DIRECT,
+                        metadata=_META_V2 + ("already_purchased", "cold_sim"))
+
+SCHEMAS = {s.version: s for s in (V1, V2, V2_NOREBUY, V3_RANK)}

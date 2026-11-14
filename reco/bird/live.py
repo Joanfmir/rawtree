@@ -263,11 +263,11 @@ class LiveState:
         out = self._columns(req, schema)
         return pd.DataFrame({f: out[f] for f in schema.features})
 
-    def matrices(self, req, schema, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def matrices(self, req, schema, rows: np.ndarray, out: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Lo mismo que features() para las filas `rows`, ya en el formato rápido de CatBoost:
         (numéricas float32 [n, k], categóricas en bytes [n, c]), en el orden de schema.numeric / schema.categorical.
         Evita pasar por pandas, que era el 75 % del tiempo de cada petición."""
-        out = self._columns(req, schema)
+        out = self._columns(req, schema) if out is None else out   # `out`: columnas ya calculadas
         num = np.empty((len(rows), len(schema.numeric)), dtype=np.float32)
         for j, f in enumerate(schema.numeric):
             num[:, j] = np.asarray(out[f], dtype=float)[rows]
