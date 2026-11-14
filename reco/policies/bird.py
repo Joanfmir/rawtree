@@ -166,3 +166,65 @@ class BirdV2(Policy):
             return []
         score = self.model.predict_matrices(*live.matrices(req, self.model.schema, cand))
         return live.ids[cand[np.argsort(-score, kind="stable")[:self.top]]].tolist()
+
+    def score(self, req, state, product_ids: list[str]) -> np.ndarray:
+        """Puntuación de Bird para una lista corta de productos (-inf: no se puede recomendar a este usuario)."""
+        live = self.live
+        mask = self._valid_mask(state, live).copy()
+        mask[live.bought(live.user(req))] = False
+        sold = self._sold.get(req.get("user_id"), ())
+        rows = np.array([live.idx.get(p, -1) for p in product_ids], dtype=int)
+        ok = np.array([i >= 0 and mask[i] and p not in sold for i, p in zip(rows, product_ids)], dtype=bool)
+        out = np.full(len(product_ids), -np.inf)
+        if ok.any():
+            out[ok] = self.model.predict_matrices(*live.matrices(req, self.model.schema, rows[ok]))
+        return out
+
+
+class BirdRank(BirdV2):
+    """bird_v2 con el modelo entrenado para ordenar (YetiRank). Solo, sobre todo el catálogo, es peor que
+    bird_v2 (aprende el orden dentro de un carrusel, no el nivel absoluto); su sitio es dentro de la mezcla."""
+    name = "bird_v2_rank"
+    model_name = "v2_rank"
+    final_name = "v2_rank_live"
+
+
+class BirdBlend(Policy):
+    """Mezcla: personal_v5 propone sus N mejores candidatos y Bird decide el orden.
+
+    Cada uno cubre el punto débil del otro: personal acierta QUÉ productos merecen estar (también con
+    usuarios nuevos) y Bird los ORDENA mejor. Offline (corte 07/11): ips_ndcg 0,25 frente a 0,21 de Bird
+    solo y 0,13 de personal_v5; con usuario oculto 0,15 frente a 0,12 y 0,11. Ver scripts/bird_blend.py.
+    """
+    name = "bird_blend"
+    bird_class = BirdV2
+    n = 50
+    refresh_every = 120.0
+
+    def fit(self, state):
+        from .personal import PersonalV5
+        self.personal = PersonalV5(until=self.until, weights={"top": self.n})
+        self.personal.fit(state)
+        self.bird = self.bird_class(until=self.until)
+        self.bird.fit(state)
+
+    def refresh(self, state):
+        for policy in (self.personal, self.bird):   # cada una lleva su propio ritmo y sus hilos
+            try:
+                policy.refresh(state)
+            except Exception as e:
+                print(f"[{self.name}] refresh de {policy.name}: {e}")
+
+    def recommend(self, req, state):
+        cand = self.personal.recommend(req, state)
+        if len(cand) < 10:   # sin candidatos suficientes: lista propia de Bird
+            return cand + [p for p in self.bird.recommend(req, state) if p not in cand]
+        score = self.bird.score(req, state, cand)
+        order = np.argsort(-score, kind="stable")   # a igualdad (o sin puntuación), el orden de personal
+        return [cand[i] for i in order if np.isfinite(score[i])]
+
+
+class BirdBlendRank(BirdBlend):
+    """La misma mezcla con el modelo de ranking: empata en ips_ndcg y va algo mejor con usuarios nuevos."""
+    name = "bird_blend_rank"
+    bird_class = BirdRank

@@ -74,9 +74,18 @@ def ranking_shown(df: pd.DataFrame, p: np.ndarray, target: str = "target_purchas
     return out
 
 
-def report(df: pd.DataFrame, p: np.ndarray, schema: FeatureSchema) -> dict[str, dict]:
+def report(df: pd.DataFrame, p: np.ndarray, schema: FeatureSchema, probabilities: bool = True) -> dict[str, dict]:
+    """probabilities=False (modelo de ranking): `p` son puntuaciones, así que solo se informan las métricas
+    que dependen del orden (PR-AUC, ROC-AUC y el ranking por petición), no logloss ni calibración."""
     w = df["sample_weight"].to_numpy() if "sample_weight" in df.columns else None
-    return {"clasificacion": classification(df[schema.target].to_numpy(), p, w),
+    y = df[schema.target].to_numpy()
+    if not probabilities:
+        both = 0 < y.sum() < len(y)
+        auc = lambda fn: float(fn(y, p, sample_weight=w)) if both else float("nan")   # noqa: E731
+        return {"orden_global": {"n": int(len(y)), "compras": int(y.sum()),
+                                 "pr_auc": auc(average_precision_score), "roc_auc": auc(roc_auc_score)},
+                "ranking_en_los_10_mostrados": ranking_shown(df, p, schema.target)}
+    return {"clasificacion": classification(y, p, w),
             "ranking_en_los_10_mostrados": ranking_shown(df, p, schema.target)}
 
 

@@ -108,12 +108,12 @@ def cmd_train(args) -> None:
               if v is not None}
     t = time.time()
     bird = train(tr, va, schema, params=params, imbalance=args.imbalance, verbose=args.verbose,
-                 early_stopping=None if args.all_data else 50)
+                 early_stopping=None if args.all_data else 50, objective=args.objective)
     bird.info["all_data"] = bool(args.all_data)
     bird.info["data"] = {"train": str(args.train), "validation": str(args.valid)}
     folder = bird.save(Path(args.out) if args.out else model_dir(schema.version, args.until))
     print(f"\nEntrenado en {time.time() - t:.1f}s · {bird.info['trees']} árboles (mejor iteración "
-          f"{bird.info['best_iteration']}) · desbalanceo: {args.imbalance}")
+          f"{bird.info['best_iteration']}) · objetivo: {args.objective} · desbalanceo: {args.imbalance}")
     print(metrics.show(bird.info["metrics"]))
     print("── importancia de las features (%)")
     print(bird.importance().round(1).head(args.top).to_string())
@@ -136,7 +136,9 @@ def cmd_eval(args) -> None:
     print(f"Modelo {bird.schema.version} ({bird.info.get('trees', '?')} árboles) sobre {path}")
     print(dataset.describe(df, bird.schema))
     p = bird.predict(df)
-    print(metrics.show(metrics.report(df, p, bird.schema)))
+    print(metrics.show(metrics.report(df, p, bird.schema, probabilities=not bird.is_ranker)))
+    if bird.is_ranker:
+        return
     print("── calibración por deciles de probabilidad predicha")
     w = df["sample_weight"].to_numpy() if "sample_weight" in df.columns else None
     print(metrics.calibration_table(df[bird.schema.target].to_numpy(), p, w=w)
@@ -213,6 +215,8 @@ def main() -> None:
     t.add_argument("--drop-purchased", action="store_true",
                    help="descartar las impresiones de productos que el usuario ya había comprado")
     t.add_argument("--threads", type=int)
+    t.add_argument("--objective", choices=["binary", "rank"], default="binary",
+                   help="binary: P(compra) por impresión · rank: ordenar cada carrusel (YetiRank, parada por NDCG@10)")
     t.add_argument("--all-data", action="store_true",
                    help="modelo final: entrena con train+validation+test y --iterations fijas")
     t.add_argument("--top", type=int, default=25, help="cuántas features enseñar en la importancia")
