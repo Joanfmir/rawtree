@@ -17,6 +17,9 @@ Tablas:
     item_feedback    (solo en vivo) producto × posición en nuestro carrusel: impresiones, clics, compras
     user_stats       usuario -> nº de eventos, nº de compras y nivel de precio (log) que mira / compra
     user_cat         usuario -> peso por categoría (compra 5, carrito 3, vista 1)
+    item_attrs       producto -> sus 2 atributos, sacados del texto de la descripción (20 posibles: "bold colours",
+                     "designed for kids"...). Los productos nuevos también los tienen: sirve para cold start
+    user_attr        usuario -> peso por atributo (compra 5, carrito 3, vista 1)
     context_popular  (device, region) -> 50 productos más comprados (para usuarios nuevos)
 """
 from __future__ import annotations
@@ -35,6 +38,25 @@ from .config import DATA_DIR
 EVENT_COLS = ("ts::DateTime64(3) AS ts, event_type::String AS event_type, user_id::String AS user_id, "
               "session_id::String AS session_id, product_id::String AS product_id, price_eur::Float64 AS price_eur, "
               "device::String AS device, region::String AS region")
+
+
+# Los 20 atributos que aparecen en shop.catalog.description (cada producto tiene 2)
+ATTRS = ["compact and lightweight", "a sporty style", "organic ingredients", "a family-size format",
+         "wireless connectivity", "smart app control", "a luxury feel", "bold colours", "a minimalist design",
+         "built for professionals", "great value for money", "whisper-quiet operation", "premium materials",
+         "designed for kids", "made from recycled materials", "a vintage look", "a waterproof shell",
+         "extra durability", "a handmade finish", "a travel-ready build"]
+_ATTR_SQL = "[" + ", ".join(f"'{a}'" for a in ATTRS) + "]"
+# producto -> atributo (una fila por atributo), con la descripción más reciente
+ITEM_ATTRS = f"""
+SELECT product_id, arrayJoin(arrayFilter(a -> position(description, a) > 0, {_ATTR_SQL})) AS attr
+FROM (
+    SELECT product_id, argMax(description, v) AS description
+    FROM (SELECT product_id::String AS product_id, description::String AS description, '' AS v FROM shop.catalog
+          UNION ALL
+          SELECT product_id::String, description::String, toString(ts) FROM shop.catalog_updates)
+    GROUP BY product_id
+)"""
 
 
 def _events(until: str | None) -> str:
@@ -171,6 +193,12 @@ def queries(until: str | None) -> dict[str, str]:
                    sum(multiIf(e.event_type = 'purchase', 5, e.event_type = 'add_to_cart', 3, 1)) AS w
             FROM {E} AS e INNER JOIN ({CURRENT_CATALOG}) AS c ON c.product_id = e.product_id
             GROUP BY user_id, category""",
+        "item_attrs": ITEM_ATTRS,
+        "user_attr": f"""
+            SELECT e.user_id AS user_id, a.attr AS attr,
+                   sum(multiIf(e.event_type = 'purchase', 5, e.event_type = 'add_to_cart', 3, 1)) AS w
+            FROM {E} AS e INNER JOIN ({ITEM_ATTRS}) AS a ON a.product_id = e.product_id
+            GROUP BY user_id, attr""",
         "context_popular": f"""
             SELECT device, region, product_id, count() AS n
             FROM {E} WHERE event_type = 'purchase' AND ts > {NOW} - INTERVAL 14 DAY

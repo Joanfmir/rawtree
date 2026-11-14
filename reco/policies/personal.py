@@ -25,6 +25,7 @@ import math
 import subprocess
 import sys
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -65,7 +66,19 @@ V3 = {**V2, "user": 0.0, "brand": 0.0, "rebuy": 0.0, "cat_fill": 2.0, "self": 1.
 #   sub_fill     más vendidos de la subcategoría vista. Peor offline (0,416 → 0,381) y en vivo la
 #                subcategoría de la última vista no convierte más que el resto de su categoría.
 V4 = {**V3, "organic": 0.0, "fb": 0.7, "cat_recency": 0.0, "sub_fill": 0.0}
-VERSIONS = {"v1": V1, "v2": V2, "v3": V3, "v4": V4}
+# v5: v4 + dos correcciones (feedback en vivo del 14/11, 37.805 peticiones):
+#   hist_off     el filtro de categoría (off = 0) ya no borra lo que el usuario tiene en su historial
+#                (user_items): fuera de la categoría vista lo multiplica por hist_off en lugar de por 0.
+#                En vivo, lo ya comprado en carrusel de OTRA categoría convirtió 0,44 % (9 compras en 2.035
+#                impresiones) frente al 0,15 % del candidato normal de la categoría vista; ~2× a igual
+#                posición. Evidencia débil (9 compras): por eso 0,5 y no 1, para no quitarle el slot 1 a la sesión.
+#   live_rebuy   0 = no se vuelve a ofrecer a un usuario lo que NUESTRO carrusel ya le vendió en vivo
+#                (README: quien ya compró algo tiende a no quererlo otra vez). user_items mete esas compras
+#                en compras_carrusel, así que en v3/v4 subían a lo más alto (hist_carousel = 4).
+#                Se refresca cada 2 min desde team.feedback, sin esperar al rebuild de features (10 min).
+#   top          devuelve 30 candidatos: finalize() rellena con los nuestros antes que con best sellers.
+V5 = {**V4, "hist_off": 0.5, "live_rebuy": 0.0, "top": 30}
+VERSIONS = {"v1": V1, "v2": V2, "v3": V3, "v4": V4, "v5": V5}
 DEFAULT_WEIGHTS = V2
 
 
@@ -101,6 +114,7 @@ class Personal(Policy):
     # El índice es de clase: en un A/B varias versiones comparten las mismas features y un solo refresh.
     _shared: dict = {}
     _building = False
+    _live_bought: frozenset = frozenset()   # {(usuario, producto)} vendidos por nuestro carrusel (v5)
 
     def __init__(self, until: str | None = None, weights: dict | None = None) -> None:
         super().__init__(until)
@@ -221,8 +235,11 @@ class Personal(Policy):
         # Historial del usuario con ese producto (señales medidas en vivo, 141.440 impresiones a conocidos):
         # comprado antes en carrusel 2,15 % por impresión (~30× lo esperado), carrito abandonado 0,30 % (~5×),
         # clic antiguo 0,25 % (~4×). Lo comprado orgánicamente no cuenta aquí (convierte 4× menos).
+        hist: set[str] = set()   # productos que han recibido bonus de historial (v5: exentos del filtro)
         if w.get("hist_carousel") or w.get("hist_cart") or w.get("hist_click"):
             for q, carts, org, car, clicks in ix.user_items.get(user, ()):
+                if car > 0 or (org <= 0 and (carts > 0 or clicks > 0)):
+                    hist.add(q)
                 if car > 0:
                     s[q] += w.get("hist_carousel", 0.0)
                 elif org > 0:
@@ -276,14 +293,24 @@ class Personal(Policy):
                 s.pop(q, None)
 
         if cats and w["off"] != 1:
-            off = w["off"]
+            off, hist_off = w["off"], w.get("hist_off", 0.0)
             for q in list(s):
                 if ix.cat_of.get(q) not in cats:
-                    if off:
-                        s[q] *= off
+                    f = hist_off if (hist_off and q in hist) else off   # v5: el historial no se borra
+                    if f:
+                        s[q] *= f
                     else:
                         del s[q]
-        return sorted((p for p in s if math.isfinite(s[p])), key=s.get, reverse=True)[:10]
+
+        # v5: ya se lo vendimos en vivo. Con el user_id tal cual: un is_new_user también puede habernos comprado.
+        uid = req.get("user_id")
+        if w.get("live_rebuy", 1.0) == 0.0 and uid:
+            sold = Personal._live_bought
+            for q in [q for q in s if (uid, q) in sold]:
+                del s[q]
+        # top > 10 (v5): finalize() se queda con los 10 primeros válidos; con margen, un agotado lo sustituye
+        # nuestro siguiente candidato y no un best seller del relleno (que puede ser algo ya vendido).
+        return sorted((p for p in s if math.isfinite(s[p])), key=s.get, reverse=True)[:int(w.get("top", 10))]
 
 
 class PersonalV3(Personal):
@@ -296,6 +323,44 @@ class PersonalV4(Personal):
     """v3 + recencia de categoría, subcategoría, descarte de lo orgánico y lift del feedback (ver V4)."""
     name = "personal_v4"
     version = "v4"
+
+
+class PersonalV5(Personal):
+    """v4 + el historial del usuario sobrevive al filtro de categoría + no recompra lo vendido en vivo (ver V5).
+
+    refresh() corre cada 2 min: actualiza las ventas en vivo (consulta pequeña, en un hilo) y delega el
+    rebuild de features de Personal cada 10 min, como en v3/v4."""
+    name = "personal_v5"
+    version = "v5"
+    refresh_every = 120.0
+    _features_at = float("-inf")
+    _live_thread: threading.Thread | None = None
+
+    def refresh(self, state):
+        if self.until is not None:
+            return
+        if time.monotonic() - PersonalV5._features_at >= Personal.refresh_every:
+            PersonalV5._features_at = time.monotonic()
+            super().refresh(state)
+        t = PersonalV5._live_thread
+        if t is None or not t.is_alive():
+            PersonalV5._live_thread = threading.Thread(target=self._update_live_bought, daemon=True)
+            PersonalV5._live_thread.start()
+
+    @staticmethod
+    def _update_live_bought() -> None:
+        from ..client import query
+        from ..config import TEAM
+        try:
+            rows = query(f"""SELECT DISTINCT r.user_id::String AS u, f.purchased::String AS p
+                             FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r
+                               ON r.request_id::String = f.request_id::String
+                             WHERE f.purchased::String != '' AND f.request_id::String != '__init__'""",
+                         timeout=30)
+            # Publicación inmutable: recommend() nunca ve el conjunto a medio construir.
+            Personal._live_bought = frozenset((r["u"], r["p"]) for r in rows)
+        except Exception as e:
+            print(f"[personal_v5] ventas en vivo no actualizadas, sigo con las anteriores: {e}")
 
 
 class PersonalV1(Personal):

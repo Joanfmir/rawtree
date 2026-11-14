@@ -26,6 +26,21 @@ Ronda que puntúa: **domingo 15/11, 10:00–12:00 CET**. La mejor versión debe 
 - Permisos de la API key: solo `SELECT` e inserción de JSON por la API. No se pueden crear tablas, ni hacer `INSERT ... SELECT`, ni borrar. Lo derivado se guarda en local (`data/`).
 - Evaluación offline: features `--until 2026-11-07` y test con `shop.history_sessions` desde esa fecha (el histórico acaba el 14/11 a las 07:08 UTC).
 
+## Versiones de Bird (nombres estandarizados)
+Las versiones de Bird se llaman **`vN-bird`**, con `N` = número de versión (v1-bird, v2-bird, v3-bird…). Ese es el
+nombre que se usa en el leaderboard (`model_version`), en el A/B y al hablar del modelo. Cada versión nueva suma 1
+y se añade a esta tabla y a `BIRD_VERSIONS` en `reco/policies/__init__.py`.
+
+| Versión | Política | Qué es |
+|---|---|---|
+| v1-bird | `bird_v1` | CatBoost con las 5 features del contrato inicial (sin personalización) |
+| v2-bird | `bird_v2` | CatBoost con 56 features (dataset v2), sin recompra; puntúa todo el catálogo |
+| v3-bird | `bird_blend_rank` | `personal_v5` propone 50 candidatos y el modelo de ranking (YetiRank) los ordena |
+
+El nombre de versión funciona como política: `make dry POLICY=v3-bird`, `make up AB=<otros brazos>,v3-bird=v3-bird`.
+Código en `reco/bird/` y `reco/policies/bird.py`; entrenamiento y evaluación con `scripts/bird.py` y
+`scripts/bird_blend.py`. La siguiente versión será **v4-bird**.
+
 ## Resultados offline (corte 2026-11-07, 3.530 compras)
 | Política | ips_hit | ips_ndcg | hit@10 |
 |---|---|---|---|
