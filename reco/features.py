@@ -9,7 +9,7 @@ Tablas:
     item_features    una fila por producto: catálogo + popularidad + tasa de compra
     user_subcat      usuario -> sus 10 subcategorías favoritas (peso: compra 5, carrito 3, vista 1)
     user_brand       usuario -> sus 5 marcas favoritas
-    user_purchases   usuario -> productos que ya compró (para no repetirlos)
+    user_purchases   usuario -> productos que ya compró (orgánico + carrusel; la recompra es la señal más fuerte)
     item_neighbors   producto -> productos relacionados (kind = 'buy': miró p y compró q en la sesión;
                      kind = 'view': vistos en la misma sesión)
     context_popular  (device, region) -> 50 productos más comprados (para usuarios nuevos)
@@ -36,6 +36,22 @@ def _events(until: str | None) -> str:
         return f"(SELECT {EVENT_COLS} FROM shop.history_events WHERE ts < '{until}')"
     return (f"(SELECT {EVENT_COLS} FROM shop.history_events "
             f"UNION ALL SELECT {EVENT_COLS} FROM shop.events)")
+
+
+def _purchases(until: str | None) -> str:
+    """Todas las compras conocidas: orgánicas (events) + del carrusel (history_sessions y, en vivo,
+    team_NN.feedback cruzado con shop.requests para saber el usuario)."""
+    from .config import TEAM
+    E = _events(until)
+    cut = f" AND ts < '{until}'" if until else ""
+    sql = (f"SELECT user_id, product_id, ts, 'organic' AS source FROM {E} WHERE event_type = 'purchase' "
+           f"UNION ALL SELECT user_id::String, purchased::String, ts::DateTime64(3), 'carousel' "
+           f"FROM shop.history_sessions WHERE purchased::String != ''{cut}")
+    if not until:
+        sql += (f" UNION ALL SELECT r.user_id::String, f.purchased::String, f.ts::DateTime64(3), 'carousel' "
+                f"FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String "
+                f"WHERE f.purchased::String != ''")
+    return sql
 
 
 def _last_day(until: str | None) -> str:
@@ -72,8 +88,10 @@ def queries(until: str | None) -> dict[str, str]:
             FROM {E} AS e INNER JOIN ({CURRENT_CATALOG}) AS c ON c.product_id = e.product_id
             GROUP BY user_id, brand ORDER BY w DESC LIMIT 5 BY user_id""",
         "user_purchases": f"""
-            SELECT user_id, product_id, count() AS n, max(ts) AS last_ts
-            FROM {E} WHERE event_type = 'purchase' GROUP BY user_id, product_id""",
+            SELECT user_id, product_id, count() AS n, max(ts) AS last_ts,
+                   countIf(source = 'carousel') AS n_carousel
+            FROM ({_purchases(until)})
+            GROUP BY user_id, product_id""",
         "item_neighbors": f"""
             SELECT p, q, n, 'buy' AS kind FROM (
                 SELECT v.product_id AS p, b.product_id AS q, count() AS n
