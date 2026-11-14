@@ -13,6 +13,7 @@ Tablas:
     user_purchases   usuario -> productos que ya compró (orgánico + carrusel; la recompra es la señal más fuerte)
     item_neighbors   producto -> productos relacionados (kind = 'buy': miró p y compró q en la sesión;
                      kind = 'view': vistos en la misma sesión)
+    user_items       hasta 3 pares útiles por usuario; vistas/carritos/compras/clics por origen
     user_stats       usuario -> nº de eventos, nº de compras y nivel de precio (log) que mira / compra
     user_cat         usuario -> peso por categoría (compra 5, carrito 3, vista 1)
     context_popular  (device, region) -> 50 productos más comprados (para usuarios nuevos)
@@ -59,6 +60,51 @@ def _purchases(until: str | None) -> str:
     return sql
 
 
+def user_items_query(until: str | None = None) -> str:
+    """Tres pares útiles por usuario; contadores separados por origen.
+
+    Tabla truncada para generar candidatos, nunca lista exhaustiva de compras
+    (para excluir comprados debe mantenerse user_purchases). Sin consultar al servir.
+    El corte offline se aplica a ambas fuentes y no incorpora eventos en vivo.
+    """
+    from .config import TEAM
+    corte = f" AND ts::DateTime64(3) < '{until}'" if until else ""
+    sesiones = f"""SELECT user_id::String AS user_id, p AS product_id,
+        0 AS vistas, 0 AS carritos, 0 AS compras_organicas,
+        countIf(purchased::String = p) AS compras_carrusel,
+        countIf(clicked::String = p) AS clics_carrusel, max(ts::DateTime64(3)) AS ultimo_ts
+        FROM shop.history_sessions
+        ARRAY JOIN arrayDistinct([clicked::String, purchased::String]) AS p
+        WHERE p != ''{corte} GROUP BY user_id, product_id"""
+    if until is None:
+        sesiones += f""" UNION ALL SELECT r.user_id::String, p, 0, 0, 0,
+            countIf(f.purchased::String = p), countIf(f.clicked::String = p), max(f.ts::DateTime64(3))
+            FROM {TEAM}.feedback f INNER JOIN shop.requests r
+            ON r.request_id::String = f.request_id::String
+            ARRAY JOIN arrayDistinct([f.clicked::String, f.purchased::String]) AS p
+            WHERE p != '' AND f.request_id::String != '__init__'
+            GROUP BY r.user_id::String, p"""
+    return f"""SELECT user_id, product_id, sum(vistas) AS vistas, sum(carritos) AS carritos,
+        sum(compras_organicas) AS compras_organicas, sum(compras_carrusel) AS compras_carrusel,
+        sum(clics_carrusel) AS clics_carrusel, max(ultimo_ts) AS ultimo_ts
+        FROM (
+            SELECT user_id, product_id, countIf(event_type = 'view') AS vistas,
+                countIf(event_type = 'add_to_cart') AS carritos,
+                countIf(event_type = 'purchase') AS compras_organicas,
+                0 AS compras_carrusel, 0 AS clics_carrusel, max(ts) AS ultimo_ts
+            FROM {_events(until)} GROUP BY user_id, product_id
+            UNION ALL {sesiones}
+        ) GROUP BY user_id, product_id
+        HAVING vistas >= 2 OR carritos > 0 OR compras_organicas > 0
+            OR compras_carrusel > 0 OR clics_carrusel > 0
+        ORDER BY user_id,
+            (compras_carrusel > 0 AND compras_organicas = 0) DESC,
+            (carritos > 0 AND compras_organicas + compras_carrusel = 0) DESC,
+            (clics_carrusel > 0 AND compras_organicas + compras_carrusel = 0) DESC,
+            vistas DESC, ultimo_ts DESC, product_id
+        LIMIT 3 BY user_id"""
+
+
 def _last_day(until: str | None) -> str:
     return f"toDateTime64('{until}', 3)" if until else "now64(3)"
 
@@ -92,6 +138,7 @@ def queries(until: str | None) -> dict[str, str]:
                    sum(multiIf(e.event_type = 'purchase', 5, e.event_type = 'add_to_cart', 3, 1)) AS w
             FROM {E} AS e INNER JOIN ({CURRENT_CATALOG}) AS c ON c.product_id = e.product_id
             GROUP BY user_id, brand ORDER BY w DESC LIMIT 5 BY user_id""",
+        "user_items": user_items_query(until),
         "user_purchases": f"""
             SELECT user_id, product_id, count() AS n, max(ts) AS last_ts,
                    countIf(source = 'carousel') AS n_carousel

@@ -49,7 +49,9 @@ V2 = {**V1, "cat_fill": 0.5, "off": 0.0}
 # marca) y la recompra orgánica no aportan. Así que: categoría (ponderada por su peso en las vistas),
 # populares de esa categoría, recién visto y co-compra; sin señales de perfil.
 V3 = {**V2, "user": 0.0, "brand": 0.0, "rebuy": 0.0, "cat_fill": 2.0, "self": 1.0, "buy": 1.0, "view": 0.1,
-      "ctx": 0.3, "pop": 0.4, "cat_share": 1.0}
+      "ctx": 0.3, "pop": 0.4, "cat_share": 1.0,
+      # historial por producto (ver recommend): lo comprado en carrusel va arriba del todo
+      "hist_carousel": 4.0, "hist_cart": 1.5, "hist_click": 1.2, "organic": 0.1}
 VERSIONS = {"v1": V1, "v2": V2, "v3": V3}
 DEFAULT_WEIGHTS = V2
 
@@ -151,6 +153,18 @@ class Personal(Policy):
         t = (pd.to_datetime(up.last_ts, utc=True, errors="coerce") - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(seconds=1)
         ix.user_bought = _group(up.user_id.tolist(), up.product_id.tolist(), up.n.clip(upper=4).tolist(), t.tolist())
 
+        # Comprado solo de forma orgánica (nunca en carrusel): en vivo convierte ~4× menos de lo esperado
+        nc = up.n_carousel if "n_carousel" in up else 0
+        org = up[(up.n - nc > 0) & (nc == 0)]
+        ix.user_organic = {u: {q for (q,) in v} for u, v in _group(org.user_id.tolist(), org.product_id.tolist()).items()}
+        # Historial útil por (usuario, producto): comprado en carrusel, carrito abandonado, clic antiguo
+        ix.user_items = {}
+        ui = f.get("user_items")
+        if ui is not None and len(ui):
+            ix.user_items = _group(ui.user_id.tolist(), ui.product_id.tolist(), ui.carritos.tolist(),
+                                   ui.compras_organicas.tolist(), ui.compras_carrusel.tolist(),
+                                   ui.clics_carrusel.tolist())
+
         cp = f["context_popular"].assign(ctx=lambda d: list(zip(d.device, d.region)))
         ix.ctx_pop = _norm_lists(cp, "ctx", "product_id", "n", 30)
         return ix
@@ -187,6 +201,24 @@ class Personal(Policy):
                 if not all(math.isfinite(float(x)) for x in (n, t)):
                     continue
                 s[q] += w["rebuy"] * (0.5 + 0.125 * n) * math.exp(-max(now - t, 0) / 86400 / w["rebuy_days"])
+
+        # Historial del usuario con ese producto (señales medidas en vivo, 141.440 impresiones a conocidos):
+        # comprado antes en carrusel 2,15 % por impresión (~30× lo esperado), carrito abandonado 0,30 % (~5×),
+        # clic antiguo 0,25 % (~4×). Lo comprado orgánicamente no cuenta aquí (convierte 4× menos).
+        if w.get("hist_carousel") or w.get("hist_cart") or w.get("hist_click"):
+            for q, carts, org, car, clicks in ix.user_items.get(user, ()):
+                if car > 0:
+                    s[q] += w.get("hist_carousel", 0.0)
+                elif org > 0:
+                    continue
+                elif carts > 0:
+                    s[q] += w.get("hist_cart", 0.0)
+                elif clicks > 0:
+                    s[q] += w.get("hist_click", 0.0)
+        if w.get("organic", 1.0) != 1.0:
+            for q in ix.user_organic.get(user, ()):
+                if q in s:
+                    s[q] *= w["organic"]
 
         # Categorías de la sesión: relleno dentro de categoría y penalización (o descarte) de lo de fuera
         cats: dict[str, float] = {}

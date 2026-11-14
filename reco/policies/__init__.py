@@ -2,8 +2,13 @@
 from .baseline import Baseline
 from .coview import Coview
 from .explore import GuliasExplore, PersonalExplore
+from .home import HomeBest
 from .personal import Personal, PersonalNoRebuy, PersonalV1, PersonalV3
 from .ranker import Ranker, RankerFeedback
 
 POLICIES = {p.name: p for p in (Baseline, Coview, Personal, PersonalV1, PersonalV3, PersonalNoRebuy,
-                                Ranker, RankerFeedback, PersonalExplore, GuliasExplore)}
+                                Ranker, RankerFeedback, PersonalExplore, GuliasExplore, HomeBest)}
+
+from .interleave import PARES  # noqa: E402  (necesita POLICIES ya definido)
+
+POLICIES.update({p.name: p for p in PARES})
