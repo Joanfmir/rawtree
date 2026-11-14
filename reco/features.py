@@ -12,6 +12,8 @@ Tablas:
     user_purchases   usuario -> productos que ya compró (orgánico + carrusel; la recompra es la señal más fuerte)
     item_neighbors   producto -> productos relacionados (kind = 'buy': miró p y compró q en la sesión;
                      kind = 'view': vistos en la misma sesión)
+    user_stats       usuario -> nº de eventos, nº de compras y nivel de precio (log) que mira / compra
+    user_cat         usuario -> peso por categoría (compra 5, carrito 3, vista 1)
     context_popular  (device, region) -> 50 productos más comprados (para usuarios nuevos)
 """
 from __future__ import annotations
@@ -108,6 +110,16 @@ def queries(until: str | None) -> dict[str, str]:
                   ON a.session_id = b.session_id
                 WHERE a.product_id != b.product_id
                 GROUP BY p, q ORDER BY n DESC LIMIT 30 BY p)""",
+        "user_stats": f"""
+            SELECT user_id, count() AS n_events, countIf(event_type = 'purchase') AS n_buys,
+                   avgIf(log(price_eur + 1), price_eur > 0) AS avg_logp,
+                   avgIf(log(price_eur + 1), event_type = 'purchase' AND price_eur > 0) AS buy_logp
+            FROM {E} GROUP BY user_id""",
+        "user_cat": f"""
+            SELECT e.user_id AS user_id, c.category::String AS category,
+                   sum(multiIf(e.event_type = 'purchase', 5, e.event_type = 'add_to_cart', 3, 1)) AS w
+            FROM {E} AS e INNER JOIN ({CURRENT_CATALOG}) AS c ON c.product_id = e.product_id
+            GROUP BY user_id, category""",
         "context_popular": f"""
             SELECT device, region, product_id, count() AS n
             FROM {E} WHERE event_type = 'purchase' AND ts > {NOW} - INTERVAL 14 DAY

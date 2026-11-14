@@ -215,3 +215,11 @@ def _epoch(ts) -> float:
         return datetime.fromisoformat(str(ts)[:19]).replace(tzinfo=timezone.utc).timestamp()
     except ValueError:
         return datetime.now(timezone.utc).timestamp()
+
+
+class PersonalNoRebuy(Personal):
+    """La política personal de Joan sin el bonus de recompra (para compararla sin esa señal)."""
+    name = "personal_norebuy"
+
+    def __init__(self, until: str | None = None, weights: dict | None = None) -> None:
+        super().__init__(until, {"rebuy": 0.0, **(weights or {})})

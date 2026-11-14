@@ -1,6 +1,7 @@
 """Registro de políticas: añade aquí las nuevas para poder usarlas con --policy."""
 from .baseline import Baseline
 from .coview import Coview
-from .personal import Personal, PersonalV1
+from .personal import Personal, PersonalNoRebuy, PersonalV1
+from .ranker import Ranker
 
-POLICIES = {p.name: p for p in (Baseline, Coview, Personal, PersonalV1)}
+POLICIES = {p.name: p for p in (Baseline, Coview, Personal, PersonalV1, PersonalNoRebuy, Ranker)}

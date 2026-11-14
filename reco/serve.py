@@ -76,17 +76,18 @@ def main() -> None:
     print(f"[serve] {config.TEAM} · " + " | ".join(f"{p.name}→{v}" for p, v in arms) + f" · dry_run={args.dry_run}")
 
     seen: set[str] = set()
-    refreshed_at, stats_at, answered, errors = 0.0, time.time(), 0, 0
+    refreshed_at = [0.0] * len(arms)
+    stats_at, answered, errors = time.time(), 0, 0
     lags: list[float] = []
     while True:
         try:
-            if time.time() - refreshed_at >= min(p.refresh_every for p, _ in arms):
-                refreshed_at = time.time()
-                for policy, _ in arms:
+            for i, (policy, _) in enumerate(arms):   # cada política refresca a su ritmo
+                if time.time() - refreshed_at[i] >= policy.refresh_every:
+                    refreshed_at[i] = time.time()
                     try:
                         policy.refresh(state)
                     except Exception as e:
-                        print(f"[policy.refresh] {e}")
+                        print(f"[policy.refresh] {policy.name}: {e}")
 
             now = time.time()
             fresh = []
