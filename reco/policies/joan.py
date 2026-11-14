@@ -12,7 +12,7 @@ Por eso:
                entrenado con el objetivo que mejor predice el leaderboard (la próxima compra orgánica) los
                reordena con las 56 features de Bird + la puntuación y el puesto de bird_v2.
                Entrenamiento: scripts/joan_ranker.py (datos anteriores al 07/11: los dos tests quedan limpios).
-  joan         enrutador: conocidos → joan_rerank; nuevos → RRF(gulias, v3-bird).
+  joan         enrutador: conocidos → joan_rerank; nuevos → RRF(gulias, v3-bird). En el leaderboard: v3-joan.
 """
 from __future__ import annotations
 

@@ -53,6 +53,7 @@ LIVE_VERSIONS: dict[str, str | None] = {
     "Bird.v2": None,                      # bird_v2 anterior al modelo sin recompra
     "v2-bird-norebuy": "bird_v2",
     "v3-bird": "bird_blend_rank",
+    "v3-joan": "joan",                    # cuenta en cuanto aparezca en el leaderboard
 }
 
 

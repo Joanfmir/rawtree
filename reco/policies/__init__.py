@@ -17,5 +17,9 @@ POLICIES.update({p.name: p for p in PARES})
 
 # Versiones de Bird con nombre estandarizado vN-bird (ver CLAUDE.md): el mismo nombre sirve de política
 # y de model_version en el leaderboard. Cada versión nueva se añade aquí.
-BIRD_VERSIONS = {"v1-bird": Bird, "v2-bird": BirdV2, "v3-bird": BirdBlendRank, "v4-bird": Joan}
+BIRD_VERSIONS = {"v1-bird": Bird, "v2-bird": BirdV2, "v3-bird": BirdBlendRank}
 POLICIES.update(BIRD_VERSIONS)
+
+# v3-joan: política joan (bird_v2 + reordenador orgánico para conocidos, RRF(gulias, v3-bird) para nuevos).
+# Mismo nombre como política y como model_version: `make up AB=bird_v2=v2-bird-norebuy,v3-joan=v3-joan`.
+POLICIES["v3-joan"] = Joan
