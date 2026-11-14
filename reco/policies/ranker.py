@@ -39,7 +39,16 @@ class Ranker(Policy):
 
     def fit(self, state):
         self.fz = Featurizer(self.load_features())
-        path = DATA_DIR / ((f"ranker_until_{self.until}" if self.until else "ranker_live") + f"{self.model_tag}.txt")
+        path = DATA_DIR / ((f"ranker_until_{features.tag(self.until)}" if self.until else "ranker_live")
+                           + f"{self.model_tag}.txt")
+        if self.until and not path.exists():
+            # p. ej. un corte de hoy: vale cualquier modelo entrenado ANTES del corte (sin fuga, algo más viejo)
+            older = sorted(p for p in DATA_DIR.glob(f"ranker_until_*{self.model_tag}.txt")
+                           if p.stem.removeprefix("ranker_until_").removesuffix(self.model_tag)[:10] <= self.until[:10]
+                           and (self.model_tag or p.stem.count("_") == 2))
+            if older:
+                print(f"[gulias] sin modelo para el corte {self.until}; se usa {older[-1].name}")
+                path = older[-1]
         self.model = lgb.Booster(model_file=str(path))
         self._live_bought: frozenset[tuple[str, str]] = frozenset()
         self._rebuilt_at = time.monotonic()

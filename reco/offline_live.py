@@ -5,8 +5,13 @@
 
 Verdad de referencia: la conversión ESPERADA de cada model_version en el leaderboard público
 (/api/state?by=model; no tiene suerte: usa la probabilidad del simulador, no la compra real).
-Offline: los carruseles de shop.history_sessions desde --until, SIN recompras (con recompras el orden
-sale al revés: el simulador penaliza recomprar), con las mismas listas que pasarían por finalize().
+
+Dos tests offline, con las mismas listas que pasarían por finalize():
+  TestSet (history)        carruseles de shop.history_sessions desde --until, SIN recompras (con
+                           recompras el orden sale al revés: el simulador penaliza recomprar); ips_ndcg.
+  OrganicTestSet (organic) peticiones reales de hoy desde un corte; objetivo: compras orgánicas nuevas
+                           del usuario en los minutos siguientes; ndcg@10. Features y modelos solo ven lo
+                           anterior al corte (features._events incluye shop.events hasta el corte).
 
 Hallazgo del 14/11 (8 versiones): ips_ndcg sin recompras ordena bien 26 de 28 parejas (Spearman 0,95),
 pero el único fallo claro fue arriba: v3-bird (mezcla) 0,260 > v2-bird-norebuy 0,207 offline y
@@ -134,23 +139,159 @@ def combine(rows: pd.DataFrame) -> pd.DataFrame:
 
 # ───────────────────────────── offline ─────────────────────────────
 
+def _features_at(until: str) -> dict[str, pd.DataFrame]:
+    from . import features
+    if not features.folder(until).exists():
+        features.build(until=until)
+    return features.load(until=until)
+
+
 @dataclass
 class TestSet:
-    """Carruseles de test (sin recompras) y el estado con el que se evalúa, como en reco.evaluate."""
+    """Carruseles de shop.history_sessions desde `until` (sin recompras), como en reco.evaluate.
+
+    Objetivo: el producto comprado en el carrusel del sistema viejo, ponderado por 1/propensity (IPS).
+    Usuarios nuevos: no hay en el test, se simulan escondiendo el usuario (segunda pasada)."""
     until: str
     df: pd.DataFrame
     state: object
     known: set
+    kind = "history"
+    main = "ips_ndcg"          # métrica principal (y "nuevo_" + main para usuarios nuevos)
+    passes = (False, True)     # pasada normal y pasada con el usuario escondido
 
     @classmethod
     def load(cls, until: str) -> TestSet:
         from . import evaluate as ev
-        from . import features
-        if not features.folder(until).exists():
-            features.build(until=until)
-        feats = features.load(until=until)
+        feats = _features_at(until)
         df = ev.drop_rebuys(ev.load_sessions(until), feats["user_purchases"])
         return cls(until, df, ev.make_state(until, feats), set(feats["user_subcat"].user_id))
+
+    @property
+    def tag(self) -> str:
+        return f"{self.kind}_{self.until}"
+
+    @property
+    def n_labels(self) -> int:
+        return int((self.df.purchased != "").sum())
+
+    def request(self, row, hide: bool) -> dict:
+        return {"request_id": row.request_id, "user_id": None if hide else row.user_id,
+                "is_new_user": hide or row.user_id not in self.known,
+                "context": row.context, "recent_views": row.recent_views, "ts": row.ts}
+
+    def rows(self, lists: dict[bool, list], new: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(peso, ganancia NDCG, acierto) por fila evaluable; `new` = segmento de usuarios nuevos."""
+        return per_row(lists[new], self.df)
+
+
+@dataclass
+class OrganicTestSet(TestSet):
+    """Peticiones REALES de hoy (shop.requests) desde `until`, de todos los equipos.
+
+    Objetivo: lo que el usuario compró por su cuenta (shop.events) en los `window` minutos siguientes,
+    quitando lo que ya había comprado antes de la petición. No depende de qué carrusel se enseñó, así
+    que no hace falta IPS. Los usuarios nuevos son los de verdad (is_new_user de la petición).
+    Las features y modelos solo ven lo anterior a `until` (ver features._events)."""
+    window: int = 30
+    end: str = ""
+    kind = "organic"
+    main = "ndcg@10"
+    passes = (False,)
+
+    @classmethod
+    def load(cls, until: str, window: int = 30, end: str | None = None, verbose: bool = True) -> OrganicTestSet:
+        from . import evaluate as ev
+        from .client import query
+        from .config import TEAM
+        feats = _features_at(until)
+        if end is None:   # la última hora completa con `window` minutos de futuro observados
+            last = pd.Timestamp(query("SELECT max(ts::DateTime64(3)) AS t FROM shop.events")[0]["t"])
+            end = str((last - pd.Timedelta(minutes=window)).floor("h"))
+        CACHE.mkdir(parents=True, exist_ok=True)
+        from .features import tag
+        cache = CACHE / f"organic_{tag(until)}_{tag(end)}_{window}m.pkl"
+        if cache.exists():
+            df = pickle.loads(cache.read_bytes())
+        else:
+            t = time.time()
+            buys = pd.DataFrame(query(f"""
+                SELECT user_id::String AS user_id, product_id::String AS product_id, ts::DateTime64(3) AS ts,
+                       'organic' AS source
+                FROM shop.events WHERE event_type::String = 'purchase'
+                  AND ts::DateTime64(3) >= '{until}' AND ts::DateTime64(3) < toDateTime64('{end}', 3) + INTERVAL {window} MINUTE
+                UNION ALL
+                SELECT r.user_id::String, f.purchased::String, f.ts::DateTime64(3), 'carousel'
+                FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String
+                WHERE f.purchased::String != '' AND f.ts::DateTime64(3) >= '{until}'
+                  AND f.ts::DateTime64(3) < '{end}'""", timeout=300))
+            reqs = pd.DataFrame(query(f"""
+                SELECT request_id::String AS request_id, ts::DateTime64(3) AS ts, user_id::String AS user_id,
+                       is_new_user::Bool AS is_new_user, context, recent_views
+                FROM shop.requests
+                WHERE ts::DateTime64(3) >= '{until}' AND ts::DateTime64(3) < '{end}'
+                  AND user_id::String IN (SELECT user_id::String FROM shop.events
+                      WHERE event_type::String = 'purchase' AND ts::DateTime64(3) >= '{until}')""", timeout=600))
+            df = organic_labels(reqs, buys, feats["user_purchases"], window)
+            cache.write_bytes(pickle.dumps(df))
+            if verbose:
+                print(f"  test orgánico construido en {time.time() - t:.0f}s")
+        return cls(until, df, ev.make_state(until, feats), set(feats["user_subcat"].user_id), window, end)
+
+    @property
+    def tag(self) -> str:
+        from .features import tag
+        return f"{self.kind}_{tag(self.until)}_{tag(self.end)}_{self.window}m"
+
+    @property
+    def n_labels(self) -> int:
+        return len(self.df)
+
+    def request(self, row, hide: bool) -> dict:
+        return {"request_id": row.request_id, "user_id": row.user_id, "is_new_user": bool(row.is_new_user),
+                "context": row.context, "recent_views": row.recent_views, "ts": row.ts}
+
+    def rows(self, lists: dict[bool, list], new: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        recs = lists[False]
+        mask = self.df.is_new_user.to_numpy(bool) if new else np.ones(len(self.df), bool)
+        g, h = [], []
+        for r, labels, m in zip(recs, self.df.labels, mask):
+            if not m:
+                continue
+            pos = [r.index(p) for p in labels if p in r]
+            h.append(1.0 if pos else 0.0)
+            g.append(1 / math.log2(min(pos) + 2) if pos else 0.0)
+        g, h = np.array(g), np.array(h)
+        return np.ones(len(g)), g, h
+
+
+def organic_labels(reqs: pd.DataFrame, buys: pd.DataFrame, prior: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Una fila por petición con al menos una compra orgánica nueva del usuario en (ts, ts + window].
+
+    "Nueva" = el usuario no lo había comprado antes de la petición: ni antes del corte (`prior`, la tabla
+    user_purchases de las features) ni entre el corte y la petición (orgánico o en nuestro carrusel)."""
+    if reqs.empty:
+        return reqs.assign(labels=[])
+    reqs = reqs.copy()
+    reqs["ts"] = pd.to_datetime(reqs.ts)
+    buys = buys.assign(ts=pd.to_datetime(buys.ts)).sort_values("ts")
+    owned = prior.groupby(prior.user_id.astype(str)).product_id.apply(lambda s: set(s.astype(str))).to_dict()
+    by_user = {u: g for u, g in buys.groupby("user_id")}
+    w = pd.Timedelta(minutes=window)
+    labels = []
+    for u, t in zip(reqs.user_id, reqs.ts):
+        g = by_user.get(u)
+        if g is None:
+            labels.append([])
+            continue
+        before = set(g.product_id[g.ts <= t]) | owned.get(u, set())
+        fut = g[(g.ts > t) & (g.ts <= t + w) & (g.source == "organic")]
+        labels.append(list(dict.fromkeys(p for p in fut.product_id if p not in before)))
+    reqs["labels"] = labels
+    reqs["recent_views"] = reqs.recent_views.apply(lambda v: v or [])
+    out = reqs[reqs.labels.str.len() > 0].sort_values("ts").reset_index(drop=True)
+    out["ts"] = out.ts.astype(str)
+    return out
 
 
 def _module_file(name: str) -> Path | None:
@@ -215,38 +356,33 @@ def policy_key(name: str, until: str) -> str:
     return h.hexdigest()[:12]
 
 
-def stale_lists(name: str, until: str, folder: Path | None = None) -> list[Path]:
-    """Cachés de `name` (de cualquier huella). Ojo: "personal" no debe arrastrar a "personal_v3"."""
-    pat = re.compile(rf"lists_{re.escape(until)}_{re.escape(name)}_[0-9a-f]{{12}}\.pkl")
-    return [p for p in (folder or CACHE).glob(f"lists_{until}_*.pkl") if pat.fullmatch(p.name)]
+def stale_lists(name: str, tag: str, folder: Path | None = None) -> list[Path]:
+    """Cachés de `name` para un test (de cualquier huella). Ojo: "personal" no debe arrastrar a "personal_v3"."""
+    pat = re.compile(rf"lists_{re.escape(tag)}_{re.escape(name)}_[0-9a-f]{{12}}\.pkl")
+    return [p for p in (folder or CACHE).glob(f"lists_{tag}_*.pkl") if pat.fullmatch(p.name)]
 
 
 def policy_lists(name: str, test: TestSet, verbose: bool = True) -> dict[bool, list[list[str]]]:
-    """Listas finales (tras finalize) para cada carrusel de test, con el usuario y sin él (cold start).
-    Se guardan en caché; se recalculan solas si cambia el código de la política o sus modelos."""
+    """Listas finales (tras finalize) para cada fila del test; en el histórico, también con el usuario
+    escondido (cold start). Caché por política: se recalcula si cambia su código o sus modelos."""
     from .policies import POLICIES
     from .safety import finalize
     CACHE.mkdir(parents=True, exist_ok=True)
-    path = CACHE / f"lists_{test.until}_{name}_{policy_key(name, test.until)}.pkl"
+    path = CACHE / f"lists_{test.tag}_{name}_{policy_key(name, test.until)}.pkl"
     if path.exists():
         return pickle.loads(path.read_bytes())
     t = time.time()
     policy = POLICIES[name](until=test.until)
     policy.fit(test.state)
     out = {}
-    for hide in (False, True):
-        recs = []
-        for row in test.df.itertuples(index=False):
-            req = {"request_id": row.request_id, "user_id": None if hide else row.user_id,
-                   "is_new_user": hide or row.user_id not in test.known,
-                   "context": row.context, "recent_views": row.recent_views, "ts": row.ts}
-            recs.append(finalize(policy.recommend(req, test.state), test.state))
-        out[hide] = recs
-    for old in stale_lists(name, test.until):
+    for hide in test.passes:
+        out[hide] = [finalize(policy.recommend(test.request(row, hide), test.state), test.state)
+                     for row in test.df.itertuples(index=False)]
+    for old in stale_lists(name, test.tag):
         old.unlink()
     path.write_bytes(pickle.dumps(out))
     if verbose:
-        print(f"  {name}: listas calculadas en {time.time() - t:.0f}s")
+        print(f"  {name} [{test.kind}]: listas calculadas en {time.time() - t:.0f}s")
     return out
 
 
@@ -264,21 +400,27 @@ def per_row(recs: list[list[str]], df: pd.DataFrame) -> tuple[np.ndarray, np.nda
     return w, gain, hit.astype(float)
 
 
-def scores(lists: dict[bool, list[list[str]]], df: pd.DataFrame) -> dict[str, float]:
+def scores(test: TestSet, lists: dict[bool, list[list[str]]]) -> dict[str, float]:
+    """Métrica principal del test (ips_ndcg en el histórico, ndcg@10 en el orgánico), acierto y versión
+    para usuarios nuevos (prefijo "nuevo_")."""
     out = {}
-    for hide, prefix in ((False, ""), (True, "nuevo_")):
-        w, g, h = per_row(lists[hide], df)
-        out[f"{prefix}ips_ndcg"] = float((w * g).sum() / w.sum())
-        out[f"{prefix}ips_hit"] = float((w * h).sum() / w.sum())
-        out[f"{prefix}hit@10"] = float(h.mean())
+    for new, prefix in ((False, ""), (True, "nuevo_")):
+        w, g, h = test.rows(lists, new)
+        if not len(w):
+            continue
+        out[f"{prefix}{test.main}"] = float((w * g).sum() / w.sum())
+        out[f"{prefix}{'ips_hit' if test.kind == 'history' else 'hit@10'}"] = float((w * h).sum() / w.sum())
+        out[f"{prefix}n"] = len(w)
     return out
 
 
-def bootstrap_diff(a: dict[bool, list], b: dict[bool, list], df: pd.DataFrame, hide: bool = False,
+def bootstrap_diff(test: TestSet, a: dict[bool, list], b: dict[bool, list], new: bool = False,
                    n: int = 1000, seed: int = 0) -> tuple[float, float, float]:
-    """ips_ndcg(a) − ips_ndcg(b) con IC del 95 % por bootstrap emparejado de carruseles."""
-    w, ga, _ = per_row(a[hide], df)
-    _, gb, _ = per_row(b[hide], df)
+    """Métrica principal de a − la de b, con IC del 95 % por bootstrap emparejado de filas del test."""
+    w, ga, _ = test.rows(a, new)
+    _, gb, _ = test.rows(b, new)
+    if not len(w):
+        return float("nan"), float("nan"), float("nan")
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, len(w), size=(n, len(w)))
     ws = w[idx]

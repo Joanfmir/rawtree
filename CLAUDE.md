@@ -11,7 +11,7 @@ Ronda que puntúa: **domingo 15/11, 10:00–12:00 CET**. La mejor versión debe 
   - `safety.py`: `finalize()` asegura 10 IDs distintos, activos y en stock. Ninguna respuesta sale sin pasar por aquí.
   - `features.py`: tablas para entrenar y servir (item_features, user_subcat, user_brand, user_purchases, item_neighbors, context_popular). Se calculan con SQL en RawTree y se guardan en `data/features_live/` o `data/features_until_<fecha>/` (Parquet).
   - `evaluate.py`: evaluación offline (`python -m reco.evaluate`). Métrica principal `ips_ndcg`/`ips_hit` **sin recompras** (corrigen el sesgo del log); `hit@10` favorece a los best sellers.
-  - `offline_live.py` + `scripts/offline_vs_live.py` (`make offline C="pol"`): contrasta la evaluación offline con el leaderboard (fiabilidad) y sitúa políticas nuevas. Ver "Evaluar un modelo nuevo".
+  - `offline_live.py` + `scripts/offline_vs_live.py` (`make offline C="pol"`): tests offline `organic` (compras orgánicas tras peticiones reales de hoy) e `history`, contrastados con el leaderboard; sitúa políticas nuevas. Ver "Evaluar un modelo nuevo".
   - `policies/personal.py`: política principal. Pesos en `DEFAULT_WEIGHTS`, ajustados con `scripts/tune.py search`.
   - `state.py`, `catalog.py`, `client.py`, `config.py`: estado, SQL del catálogo, acceso a la API, `.env`.
 - `scripts/tune.py` (`ablation` | `search`), `scripts/build_features.py` (`--until YYYY-MM-DD` para la versión offline, ~15 s), `scripts/check.py` (conexión y tamaño de las tablas), `scripts/monitor.py` (feedback en vivo).
@@ -25,7 +25,7 @@ Ronda que puntúa: **domingo 15/11, 10:00–12:00 CET**. La mejor versión debe 
 - Las columnas de RawTree son `Dynamic`: los JOIN y `argMax` necesitan casts (`product_id::String`, `ts::DateTime64(3)`).
 
 - Permisos de la API key: solo `SELECT` e inserción de JSON por la API. No se pueden crear tablas, ni hacer `INSERT ... SELECT`, ni borrar. Lo derivado se guarda en local (`data/`).
-- Evaluación offline: features `--until 2026-11-07` y test con `shop.history_sessions` desde esa fecha (el histórico acaba el 14/11 a las 07:08 UTC).
+- Evaluación offline: features `--until 2026-11-07` y test con `shop.history_sessions` desde esa fecha (el histórico acaba el 14/11 a las 07:08 UTC). Un `until` con hora (p. ej. `2026-11-14 12:00:00`) incluye también `shop.events`, `catalog_updates` y nuestro feedback anteriores al corte.
 
 ## Versiones de Bird (nombres estandarizados)
 Las versiones de Bird se llaman **`vN-bird`**, con `N` = número de versión (v1-bird, v2-bird, v3-bird…). Ese es el
@@ -44,32 +44,36 @@ Código en `reco/bird/` y `reco/policies/bird.py`; entrenamiento y evaluación c
 
 ## Fiabilidad de la evaluación offline (14/11, 8 versiones servidas)
 Verdad: conversión **esperada** de cada `model_version` en el leaderboard (`/api/state?by=model`, sin suerte).
-Offline: `history_sessions` desde el 07/11, **sin recompras** (1.096 compras).
+`make offline` evalúa con dos tests:
+- **organic** (principal): peticiones reales de hoy de 12:00 a 20:00 UTC (`shop.requests`, de todos los equipos);
+  objetivo = lo que el usuario compró **por su cuenta** (`shop.events`) en los 30 min siguientes, sin lo que ya
+  tenía. 7.060 peticiones (1.597 de usuarios nuevos reales). Features y modelos solo ven lo anterior a las 12:00.
+- **history**: carruseles de `history_sessions` desde el 07/11, **sin recompras**, ponderados por IPS (1.096 compras).
 
-| Métrica offline | Spearman con el leaderboard | Parejas bien | Parejas claras bien |
-|---|---|---|---|
-| `ips_ndcg` sin recompras | **0,95** | **26/28** | **13/13** |
-| `hit@10` sin recompras | 0,74 | 23/28 | 10/13 |
-| `ips_ndcg` CON recompras | −0,14 | 12/28 | 6/14 |
-| `hit@10` CON recompras | −0,60 | 8/28 | 3/14 |
-| `nuevo_ips_ndcg` vs conv. de nuevos | 0,78 | 22/28 | 5/5 |
+| Test · métrica | Spearman con el leaderboard | Parejas bien | Parejas claras bien | v2-bird-norebuy > v3-bird |
+|---|---|---|---|---|
+| **organic · `ndcg@10`** | **0,98** | **27/28** | **14/14** | **sí** |
+| history · `ips_ndcg` | 0,95 | 26/28 | 14/14 | no (al revés) |
+| history · `ips_ndcg` CON recompras | −0,14 | 12/28 | — | — |
+| history · `hit@10` CON recompras | −0,60 | 8/28 | — | — |
+| organic · `nuevo_ndcg@10` vs conv. de nuevos | 0,73 | 22/28 | 5/5 | — |
+| history · `nuevo_ips_ndcg` vs conv. de nuevos | 0,85 | 24/28 | 5/5 | — |
 
-- **Sirve para descartar**: si una política sale claramente peor offline, no hace falta llevarla al vivo.
-- **No sirve para decidir entre dos buenas**: falla justo arriba: v3-bird 0,260 > v2-bird-norebuy 0,207 offline, pero
-  1,49 < 1,79 en el leaderboard (diferencia en el límite de "clara"). La mezcla v3-bird es la más sobrevalorada
-  (residuo −0,24 en la calibración) y bird_v2 la más infravalorada (+0,25).
-- "Parejas claras": el leaderboard las separa por más de 2 errores estándar (binomial, conservador).
-- Las cifras con recompras son de `reco.evaluate --with-rebuy`; el resto, de `make offline`.
+- **El orgánico es el test de referencia**: ordena bien también arriba (el histórico sobrevaloraba la mezcla v3-bird)
+  y tiene intervalos ~4 veces más estrechos. Si los dos tests se contradicen, el script hace caso al que mejor ordena.
+- **Usuarios nuevos**: ninguno de los dos tests es fiable para matices de cold start (Spearman 0,73–0,85 con 8 puntos).
 - **Nunca** mirar métricas con recompras (`--with-rebuy`): el simulador penaliza recomprar y el orden sale al revés.
+- "Parejas claras": el leaderboard las separa por más de 2 errores estándar (binomial, conservador).
 - La fiabilidad se recalcula sola con `make offline`; cada versión nueva en vivo se añade a `LIVE_VERSIONS`.
 
 ## Evaluar un modelo nuevo
 1. Traer el código de la branch del modelo (`git merge origin/<branch>`) y sus modelos de `data/` (están en
    `.gitignore`: hay que subirlos a propósito o copiarlos). El modelo para offline debe estar entrenado **solo con
-   datos anteriores al 07/11**; si no, hay fuga y saldrá inflado.
+   datos anteriores al 07/11** (sirve para los dos tests); si no, hay fuga y saldrá inflado. Las políticas con
+   `until` deben cargar ese modelo, no el de producción (como `bird_v2` con `v2_fresh`).
 2. Registrar la política en `reco/policies/__init__.py`.
-3. `make offline C="<política>"`: tabla en vivo vs offline, fiabilidad actual, y para el candidato Δ `ips_ndcg`
-   (IC 95 % bootstrap) frente a la mejor versión en vivo, en conocidos y en nuevos, con veredicto:
+3. `make offline C="<política>"`: tabla en vivo vs offline, fiabilidad actual, y para el candidato la diferencia
+   frente a la mejor versión en vivo (IC 95 % bootstrap) en cada test, en todos y en nuevos, con veredicto:
    PEOR → descartar · EMPATE → solo el vivo decide · MEJOR → A/B simultáneo antes de pasar a producción.
 4. Si va al vivo, añadir su `model_version` → política a `LIVE_VERSIONS` en `reco/offline_live.py`.
 
