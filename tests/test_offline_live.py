@@ -62,19 +62,56 @@ class MetricsTest(unittest.TestCase):
         self.assertAlmostEqual(h.mean(), ref["hit@10"])
 
     def test_bootstrap_identical_is_zero(self):
-        df = _df()
+        test = ol.TestSet("x", _df(), None, set())
         recs = [["p1"] * 10, ["p2"] * 10, ["p3"] * 10, ["x"] * 10]
         lists = {False: recs, True: recs}
-        d, lo, hi = ol.bootstrap_diff(lists, lists, df, n=200)
+        d, lo, hi = ol.bootstrap_diff(test, lists, lists, n=200)
         self.assertEqual((d, lo, hi), (0.0, 0.0, 0.0))
 
     def test_bootstrap_sign(self):
-        df = _df()
+        test = ol.TestSet("x", _df(), None, set())
         good = {False: [["p1"] * 10, ["p2"] * 10, ["p3"] * 10, ["p4"] * 10]}
         bad = {False: [["x"] * 10] * 4}
-        d, lo, hi = ol.bootstrap_diff(good, bad, df, n=200)
+        d, lo, hi = ol.bootstrap_diff(test, good, bad, n=200)
         self.assertGreater(d, 0)
         self.assertGreaterEqual(lo, 0)
+
+
+class OrganicTest(unittest.TestCase):
+    def test_labels_exclude_owned_and_window(self):
+        reqs = pd.DataFrame({"request_id": ["r1", "r2", "r3"], "user_id": ["u1", "u1", "u2"],
+                             "ts": ["2026-11-14 12:00:00", "2026-11-14 12:20:00", "2026-11-14 12:00:00"],
+                             "is_new_user": [False, False, True], "context": [{}] * 3,
+                             "recent_views": [None, [], []]})
+        buys = pd.DataFrame({
+            "user_id": ["u1", "u1", "u1", "u1", "u2"],
+            "product_id": ["a", "b", "old", "late", "c"],
+            "ts": ["2026-11-14 12:10:00", "2026-11-14 12:25:00", "2026-11-14 12:05:00",
+                   "2026-11-14 13:30:00", "2026-11-14 12:01:00"],
+            "source": ["organic", "organic", "organic", "organic", "carousel"]})
+        prior = pd.DataFrame({"user_id": ["u1"], "product_id": ["old"]})
+        out = ol.organic_labels(reqs, buys, prior, window=30)
+        got = dict(zip(out.request_id, out.labels))
+        # r1: a y b dentro de 30 min; "old" ya era suyo; "late" fuera de la ventana
+        self.assertEqual(got["r1"], ["a", "b"])
+        # r2: "a" se compró antes de la petición → no cuenta; queda b
+        self.assertEqual(got["r2"], ["b"])
+        # r3: la única compra es del carrusel, no orgánica → sin etiqueta, fuera del test
+        self.assertNotIn("r3", got)
+        self.assertEqual(out.recent_views.iloc[0], [])
+
+    def test_rows_best_position_and_new_users(self):
+        df = pd.DataFrame({"labels": [["a", "b"], ["z"], ["c"]], "is_new_user": [False, False, True]})
+        test = ol.OrganicTestSet("cut", df, None, set())
+        recs = [["x", "b", "a"] + ["q"] * 7, ["q"] * 10, ["c"] + ["q"] * 9]
+        w, g, h = test.rows({False: recs}, new=False)
+        np.testing.assert_allclose(h, [1, 0, 1])
+        np.testing.assert_allclose(g, [1 / np.log2(3), 0, 1])
+        w, g, h = test.rows({False: recs}, new=True)
+        np.testing.assert_allclose(h, [1])
+        s = ol.scores(test, {False: recs})
+        self.assertAlmostEqual(s["hit@10"], 2 / 3)
+        self.assertEqual(s["nuevo_n"], 1)
 
 
 class AgreementTest(unittest.TestCase):

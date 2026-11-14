@@ -34,7 +34,7 @@ CHUNKED, CHUNKS = ("user_sub", "user_brand", "user_cat", "user_attr", "user_prod
 
 
 def folder(until: str | None) -> Path:
-    return DATA_DIR / "bird" / (f"state_until_{until}" if until else "state_live")
+    return DATA_DIR / "bird" / (f"state_until_{features.tag(until)}" if until else "state_live")
 
 
 # ── SQL ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -44,8 +44,9 @@ def _catalog_sql(until: str | None) -> str:
     cols = ("product_id::String AS product_id, category::String AS r_cat, subcategory::String AS r_sub, "
             "brand::String AS r_brand, price_eur::Float64 AS r_price, description::String AS r_desc, "
             "toString(created_at::DateTime64(3)) AS r_created")
-    if until:
-        inner = f"SELECT {cols}, '' AS v FROM shop.catalog"
+    if until:   # catalog_updates anteriores al corte (vacía antes del 14/11)
+        inner = (f"SELECT {cols}, '' AS v FROM shop.catalog UNION ALL "
+                 f"SELECT {cols}, toString(ts::DateTime64(3)) AS v FROM shop.catalog_updates WHERE ts < '{until}'")
     else:
         inner = (f"SELECT {cols}, '' AS v FROM shop.catalog UNION ALL "
                  f"SELECT {cols}, toString(ts::DateTime64(3)) AS v FROM shop.catalog_updates")
@@ -63,9 +64,15 @@ def _events_sql(until: str | None) -> str:
           "event_type::String = 'add_to_cart', 3, 1) AS w")
     ca = ("user_id::String AS user_id, clicked::String AS product_id, ts::DateTime64(3) AS ts, "
           "if(purchased::String != '', 'c_purchase', 'c_click') AS kind, if(purchased::String != '', 5, 1) AS w")
-    if until:
+    if until:   # todo lo anterior al corte; shop.events y feedback están vacíos antes del 14/11
         return (f"(SELECT {ev} FROM shop.history_events WHERE ts < '{until}' UNION ALL "
-                f"SELECT {ca} FROM shop.history_sessions WHERE clicked::String != '' AND ts < '{until}')")
+                f"SELECT {ev} FROM shop.events WHERE ts < '{until}' UNION ALL "
+                f"SELECT {ca} FROM shop.history_sessions WHERE clicked::String != '' AND ts < '{until}' UNION ALL "
+                f"SELECT r.user_id::String, f.clicked::String, f.ts::DateTime64(3), "
+                f"if(f.purchased::String != '', 'c_purchase', 'c_click'), if(f.purchased::String != '', 5, 1) "
+                f"FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String "
+                f"WHERE f.clicked::String != '' AND f.request_id::String != '__init__' "
+                f"AND f.ts::DateTime64(3) < '{until}')")
     return (f"(SELECT {ev} FROM shop.history_events UNION ALL SELECT {ev} FROM shop.events UNION ALL "
             f"SELECT {ca} FROM shop.history_sessions WHERE clicked::String != '' UNION ALL "
             f"SELECT r.user_id::String, f.clicked::String, f.ts::DateTime64(3), "

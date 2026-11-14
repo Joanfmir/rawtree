@@ -59,10 +59,17 @@ FROM (
 )"""
 
 
+def tag(until: str) -> str:
+    """Nombre de carpeta/fichero para un corte: '2026-11-07' → igual; '2026-11-14 15:00:00' → '2026-11-14T150000'."""
+    return until.replace(" ", "T").replace(":", "")
+
+
 def _events(until: str | None) -> str:
-    """Fuente de eventos: historia antes del corte (offline) o historia + stream en vivo (live)."""
+    """Fuente de eventos: todo lo anterior al corte (offline) o historia + stream en vivo (live).
+    Con corte también entra shop.events (vacía antes del 14/11): así un corte de hoy ve el stream hasta esa hora."""
     if until:
-        return f"(SELECT {EVENT_COLS} FROM shop.history_events WHERE ts < '{until}')"
+        return (f"(SELECT {EVENT_COLS} FROM shop.history_events WHERE ts < '{until}' "
+                f"UNION ALL SELECT {EVENT_COLS} FROM shop.events WHERE ts < '{until}')")
     return (f"(SELECT {EVENT_COLS} FROM shop.history_events "
             f"UNION ALL SELECT {EVENT_COLS} FROM shop.events)")
 
@@ -76,10 +83,10 @@ def _purchases(until: str | None) -> str:
     sql = (f"SELECT user_id, product_id, ts, 'organic' AS source FROM {E} WHERE event_type = 'purchase' "
            f"UNION ALL SELECT user_id::String, purchased::String, ts::DateTime64(3), 'carousel' "
            f"FROM shop.history_sessions WHERE purchased::String != ''{cut}")
-    if not until:
-        sql += (f" UNION ALL SELECT r.user_id::String, f.purchased::String, f.ts::DateTime64(3), 'carousel' "
-                f"FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String "
-                f"WHERE f.purchased::String != ''")
+    fb_cut = f" AND f.ts::DateTime64(3) < '{until}'" if until else ""
+    sql += (f" UNION ALL SELECT r.user_id::String, f.purchased::String, f.ts::DateTime64(3), 'carousel' "
+            f"FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String "
+            f"WHERE f.purchased::String != ''{fb_cut}")
     return sql
 
 
@@ -99,13 +106,14 @@ def user_items_query(until: str | None = None) -> str:
         FROM shop.history_sessions
         ARRAY JOIN arrayDistinct([clicked::String, purchased::String]) AS p
         WHERE p != ''{corte} GROUP BY user_id, product_id"""
-    if until is None:
+    if True:   # nuestro feedback también cuenta con corte (solo lo anterior al corte)
+        fb_cut = f" AND f.ts::DateTime64(3) < '{until}'" if until else ""
         sesiones += f""" UNION ALL SELECT r.user_id::String, p, 0, 0, 0,
             countIf(f.purchased::String = p), countIf(f.clicked::String = p), max(f.ts::DateTime64(3))
             FROM {TEAM}.feedback f INNER JOIN shop.requests r
             ON r.request_id::String = f.request_id::String
             ARRAY JOIN arrayDistinct([f.clicked::String, f.purchased::String]) AS p
-            WHERE p != '' AND f.request_id::String != '__init__'
+            WHERE p != '' AND f.request_id::String != '__init__'{fb_cut}
             GROUP BY r.user_id::String, p"""
     return f"""SELECT user_id, product_id, sum(vistas) AS vistas, sum(carritos) AS carritos,
         sum(compras_organicas) AS compras_organicas, sum(compras_carrusel) AS compras_carrusel,
@@ -300,7 +308,7 @@ LEFT JOIN semana AS s ON c.product_id = s.product_id
 
 
 def folder(until: str | None) -> Path:
-    return DATA_DIR / (f"features_until_{until}" if until else "features_live")
+    return DATA_DIR / (f"features_until_{tag(until)}" if until else "features_live")
 
 
 def build(until: str | None = None, only: list[str] | None = None, verbose: bool = True) -> dict[str, pd.DataFrame]:
