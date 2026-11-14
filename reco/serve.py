@@ -47,6 +47,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--policy", default="baseline", choices=sorted(POLICIES))
     ap.add_argument("--dry-run", action="store_true", help="no inserta en submissions")
+    ap.add_argument("--name", help="model_version que verá el leaderboard (por defecto, el nombre de la política)")
     ap.add_argument("--poll", type=float, default=0.3, help="segundos entre lecturas")
     args = ap.parse_args()
     config.check()
@@ -63,8 +64,8 @@ def main() -> None:
     threading.Thread(target=_keep_state_fresh, args=(state,), daemon=True).start()
     policy = POLICIES[args.policy]()
     policy.fit(state)
-    version = f"{policy.name}{'-dry' if args.dry_run else ''}"
-    print(f"[serve] {config.TEAM} · política={policy.name} · dry_run={args.dry_run}")
+    version = f"{args.name or policy.name}{'-dry' if args.dry_run else ''}"
+    print(f"[serve] {config.TEAM} · política={policy.name} · versión={version} · dry_run={args.dry_run}")
 
     seen: set[str] = set()
     refreshed_at, stats_at, answered, errors = 0.0, time.time(), 0, 0
