@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from catboost import CatBoostClassifier, Pool
+from catboost import CatBoostClassifier, FeaturesData, Pool
 
 from ..config import DATA_DIR
 from . import metrics
@@ -51,6 +51,16 @@ class BirdModel:
             return np.zeros(0)
         return self.model.predict_proba(self.pool(df), thread_count=1)[:, 1]
 
+    def predict_matrices(self, num: np.ndarray, cat: np.ndarray) -> np.ndarray:
+        """P(compra) desde matrices ya preparadas (ver LiveState.matrices). CatBoost empareja las columnas por
+        nombre, así que da exactamente lo mismo que predict() con un DataFrame, unas 10 veces más rápido."""
+        if len(num) == 0:
+            return np.zeros(0)
+        data = FeaturesData(num_feature_data=num, cat_feature_data=cat,
+                            num_feature_names=list(self.schema.numeric),
+                            cat_feature_names=list(self.schema.categorical))
+        return self.model.predict_proba(Pool(data), thread_count=1)[:, 1]
+
     def importance(self) -> pd.Series:
         imp = pd.Series(self.model.get_feature_importance(), index=list(self.schema.features))
         return imp.sort_values(ascending=False)
@@ -79,8 +89,9 @@ class BirdModel:
 
 
 def train(train_df: pd.DataFrame, valid_df: pd.DataFrame, schema: FeatureSchema, params: dict | None = None,
-          imbalance: str = "none", early_stopping: int = 50, verbose: int = 0) -> BirdModel:
-    """Entrena con parada temprana sobre `valid_df` (posterior en el tiempo a `train_df`)."""
+          imbalance: str = "none", early_stopping: int | None = 50, verbose: int = 0) -> BirdModel:
+    """Entrena con parada temprana sobre `valid_df` (posterior en el tiempo a `train_df`).
+    early_stopping=None: nº fijo de iteraciones (modelo final con todos los datos; `valid_df` solo informa)."""
     params = {**DEFAULT_PARAMS, **(params or {})}
     if IMBALANCE[imbalance]:
         params["auto_class_weights"] = IMBALANCE[imbalance]
@@ -91,8 +102,8 @@ def train(train_df: pd.DataFrame, valid_df: pd.DataFrame, schema: FeatureSchema,
     valid_pool = Pool(prepare(valid_df, schema), label=valid_df[schema.target].to_numpy(), cat_features=cats,
                       weight=weight(valid_df))
     model = CatBoostClassifier(**params)
-    model.fit(train_pool, eval_set=valid_pool, early_stopping_rounds=early_stopping, use_best_model=True,
-              verbose=verbose)
+    model.fit(train_pool, eval_set=valid_pool, early_stopping_rounds=early_stopping,
+              use_best_model=early_stopping is not None, verbose=verbose)
     bird = BirdModel(model, schema)
     bird.info = {
         "version": schema.version,

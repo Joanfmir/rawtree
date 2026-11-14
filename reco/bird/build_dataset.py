@@ -256,8 +256,11 @@ def session_features(sess: pd.DataFrame, shown: np.ndarray, cat: pd.DataFrame) -
     cat_ = cat.category.astype("category").cat.codes.to_numpy()
     brand = cat.brand.astype("category").cat.codes.to_numpy()
     logp = cat.logp.to_numpy()
-    a1 = cat.attr1.astype("category").cat.codes.to_numpy()
-    a2 = cat.attr2.astype("category").cat.codes.to_numpy()
+    # attr1 y attr2 comparten códigos (si no, "attr1 de uno == attr2 de otro" compararía números sin relación);
+    # sin atributo = código propio negativo y distinto en cada hueco, para que nunca cuente como coincidencia
+    code = {a: i for i, a in enumerate(ATTRS)}
+    a1 = cat.attr1.map(code).fillna(-1).to_numpy(dtype=int)
+    a2 = cat.attr2.map(code).fillna(-2).to_numpy(dtype=int)
     out = np.zeros((len(sess), 10, len(SESSION_COLS)))
     out[:, :, SESSION_COLS.index("sv_logp_diff")] = np.nan
     week = np.searchsorted(np.array(WEEKS, dtype="datetime64[ns]"), sess.ts.to_numpy().astype("datetime64[ns]"),

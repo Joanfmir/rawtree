@@ -71,23 +71,45 @@ def cmd_dataset(args) -> None:
     print(f"→ {out}  ({len(schema.features)} features; columnas: {parts['train'].shape[1]})")
 
 
+def cmd_state(args) -> None:
+    """Resumen de la historia de cada usuario que usa bird_v2 al servir (reco/bird/live.py)."""
+    from reco.bird import live
+    print(f"→ {live.download(args.until, verbose=True)}")
+
+
 def cmd_train(args) -> None:
     schema = SCHEMAS[args.schema]
     args.train, args.valid = args.train or data_path(args, "train"), args.valid or data_path(args, "validation")
     tr, va = dataset.load(args.train), dataset.load(args.valid)
+    if args.all_data:
+        # Modelo de producción: train + validation + test, con el nº de árboles que eligió la parada temprana
+        # del modelo validado. Las métricas que salen aquí son sobre datos vistos: NO sirven para comparar.
+        if not args.iterations:
+            raise SystemExit("--all-data necesita --iterations (usa la 'mejor iteración' del modelo validado)")
+        te = dataset.load(data_path(args, "test"))
+        va, tr = te, __import__("pandas").concat([tr, va, te], ignore_index=True)
+        args.force = True
     problems = dataset.validate(tr, va, schema, strict=not args.force)
     for p in problems:
         print(f"[contrato] {p}")
     print(f"train       {dataset.describe(tr, schema)}\nvalidation  {dataset.describe(va, schema)}")
+    if args.drop_purchased:
+        # En vivo lo ya comprado convierte ~9x menos y nunca se recomienda: el modelo aprende a elegir
+        # entre lo que el usuario todavía no tiene (igual que el ranker LightGBM).
+        tr, va = tr[tr.already_purchased == 0], va[va.already_purchased == 0]
+        print(f"sin productos ya comprados: train {dataset.describe(tr, schema)}")
     cold = args.cold_share if args.cold_share is not None else (0.0 if args.schema == "v1" else 0.3)
     if cold > 0:
         from reco.bird.build_dataset import simulate_cold
         tr = simulate_cold(tr, cold)
         print(f"cold start: en el {cold:.0%} de las peticiones de train se esconde la historia del usuario")
     params = {k: v for k, v in (("iterations", args.iterations), ("depth", args.depth),
-                                ("learning_rate", args.learning_rate)) if v is not None}
+                                ("learning_rate", args.learning_rate), ("thread_count", args.threads))
+              if v is not None}
     t = time.time()
-    bird = train(tr, va, schema, params=params, imbalance=args.imbalance, verbose=args.verbose)
+    bird = train(tr, va, schema, params=params, imbalance=args.imbalance, verbose=args.verbose,
+                 early_stopping=None if args.all_data else 50)
+    bird.info["all_data"] = bool(args.all_data)
     bird.info["data"] = {"train": str(args.train), "validation": str(args.valid)}
     folder = bird.save(Path(args.out) if args.out else model_dir(schema.version, args.until))
     print(f"\nEntrenado en {time.time() - t:.1f}s · {bird.info['trees']} árboles (mejor iteración "
@@ -179,11 +201,20 @@ def main() -> None:
     d.add_argument("--refresh", action="store_true", help="volver a descargar todo (ignora data/bird/raw/)")
     d.set_defaults(fn=cmd_dataset)
 
+    st = sub.add_parser("state", help="descarga el estado de usuarios para servir bird_v2")
+    st.add_argument("--until", help="corte para la evaluación offline (YYYY-MM-DD); sin él, en vivo")
+    st.set_defaults(fn=cmd_state)
+
     t = sub.add_parser("train", help="entrena y guarda el modelo")
     t.add_argument("--train", help="parquet de entrenamiento (por defecto, el del esquema)")
     t.add_argument("--valid", help="parquet de validación (por defecto, el del esquema)")
     t.add_argument("--cold-share", type=float,
                    help="parte de las peticiones de train tratadas como usuario nuevo (por defecto 0,3 en v2)")
+    t.add_argument("--drop-purchased", action="store_true",
+                   help="descartar las impresiones de productos que el usuario ya había comprado")
+    t.add_argument("--threads", type=int)
+    t.add_argument("--all-data", action="store_true",
+                   help="modelo final: entrena con train+validation+test y --iterations fijas")
     t.add_argument("--top", type=int, default=25, help="cuántas features enseñar en la importancia")
     t.add_argument("--imbalance", choices=sorted(IMBALANCE), default="none",
                    help="reponderar las compras (descalibra las probabilidades; por defecto no)")
