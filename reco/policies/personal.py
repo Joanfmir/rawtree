@@ -34,6 +34,11 @@ DEFAULT_WEIGHTS = {
     "brand": 0.5, "rebuy": 1.0, "rebuy_days": 30.0, "decay": 0.6,
 }
 
+# Señales que devuelve signals(), en este orden. Las anteriores a 'brand' se suman con su peso;
+# 'brand' multiplica; 'score' es el resultado.
+SIGNALS = ("self", "buy", "view", "user", "ctx", "pop", "rebuy", "brand", "score")
+_SELF, _BUY, _VIEW, _USER, _CTX, _POP, _REBUY, _BRAND, _SCORE = range(len(SIGNALS))
+
 
 def _norm_lists(df, key, item, val, top):
     """{key: [(item, val / max_val_of_key), ...]} ordenado por val desc, máximo `top` por clave."""
@@ -101,6 +106,7 @@ class Personal(Policy):
         ix = SimpleNamespace()
         items = f["item_features"].fillna(0)
         ix.brand_of = dict(zip(items.product_id, items.brand))
+        ix.subcat_of = dict(zip(items.product_id, items.subcategory))
         pop = np.log1p(items.purchases_7d.to_numpy(dtype=float))
         items = items.assign(pop=pop / max(pop.max(), 1e-9))
         ix.top_pop = list(items.nlargest(50, "pop")[["product_id", "pop"]].itertuples(index=False, name=None))
@@ -124,42 +130,56 @@ class Personal(Policy):
         ix.ctx_pop = _norm_lists(cp, "ctx", "product_id", "n", 30)
         return ix
 
-    def recommend(self, req, state):
+    def signals(self, req, state=None):
+        """Señales SIN pesos de cada candidato: (SIGNALS, {producto: [valor por señal]}).
+        La última, 'score', es la nota de esta política (suma con pesos × marca). recommend() ordena
+        por ella y el re-ranker (policies/hgb.py) usa todas como columnas: una señal nueva añadida
+        aquí y en SIGNALS le llega sola al reentrenar."""
         w, ix = self.w, self.ix   # una sola lectura: si el hilo de refresh cambia el índice, no nos afecta
-        s: dict[str, float] = defaultdict(float)
+        c: dict[str, list[float]] = defaultdict(lambda: [0.0] * len(SIGNALS))
 
         views = req.get("recent_views") or []
         for k, v in enumerate(reversed(views)):
             d = w["decay"] ** k
             p = v["product_id"]
-            s[p] += w["self"] * d
+            c[p][_SELF] += d
             for q, n in ix.nb_buy.get(p, ()):
-                s[q] += w["buy"] * d * n
+                c[q][_BUY] += d * n
             for q, n in ix.nb_view.get(p, ()):
-                s[q] += w["view"] * d * n
+                c[q][_VIEW] += d * n
 
         user = None if req.get("is_new_user") else req.get("user_id")
         for sub, a in ix.user_subcat.get(user, ()):
             for q, n in ix.subcat_top.get(sub, ()):
-                s[q] += w["user"] * a * n
+                c[q][_USER] += a * n
 
         ctx = req.get("context") or {}
         for q, n in ix.ctx_pop.get((ctx.get("device"), ctx.get("region")), ()):
-            s[q] += w["ctx"] * n
+            c[q][_CTX] += n
         for q, n in ix.top_pop:
-            s[q] += w["pop"] * n
+            c[q][_POP] += n
 
         bought = ix.user_bought.get(user, ())
         if bought:
             now = _epoch(req.get("ts"))
             for q, n, t in bought:
-                s[q] += w["rebuy"] * (0.5 + 0.125 * n) * math.exp(-max(now - t, 0) / 86400 / w["rebuy_days"])
+                days = max(now - t, 0) / 86400
+                # rebuy_ramp > 0 (personal2): al revés, lo recién comprado casi no cuenta y sube hasta 1
+                ramp = w.get("rebuy_ramp", 0)
+                rec = min(days / ramp, 1.0) if ramp else math.exp(-days / w["rebuy_days"])
+                c[q][_REBUY] += (0.5 + 0.125 * n) * rec
 
         brands = ix.user_brand.get(user)
-        if brands:
-            for q in s:
-                s[q] *= 1 + w["brand"] * brands.get(ix.brand_of.get(q), 0)
-        return sorted(s, key=s.get, reverse=True)[:10]
+        ws, wb = [w[k] for k in SIGNALS[:_BRAND]], w["brand"]
+        for q, v in c.items():
+            if brands:
+                v[_BRAND] = brands.get(ix.brand_of.get(q), 0)
+            v[_SCORE] = sum(x * y for x, y in zip(v, ws)) * (1 + wb * v[_BRAND])
+        return SIGNALS, c
+
+    def recommend(self, req, state):
+        _, c = self.signals(req, state)
+        return sorted(c, key=lambda q: c[q][_SCORE], reverse=True)[:10]
 
 
 def _epoch(ts) -> float:

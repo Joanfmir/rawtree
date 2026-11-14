@@ -24,6 +24,15 @@ class Policy:
         No hace falta que sea válida: safety.finalize() la limpia y la completa."""
         raise NotImplementedError
 
+    def signals(self, req: Record, state: State):
+        """Opcional. (nombres, {producto: [valor por nombre]}): señales de cada candidato, la última
+        es la nota de la política. Es lo que necesita una política para servir de base al re-ranker hgb."""
+        raise NotImplementedError(f"{self.name} no expone signals(): no puede ser la base de hgb")
+
+    def share(self, policies: list["Policy"]) -> None:
+        """serve la llama antes de fit() con todas las políticas del proceso (test A/B), por si
+        alguna puede reutilizar a otra en vez de cargar lo mismo dos veces."""
+
     def load_features(self):
         """Features de self.until; en producción las construye si no existen."""
         from .. import features
