@@ -38,10 +38,22 @@ y se añade a esta tabla y a `BIRD_VERSIONS` en `reco/policies/__init__.py`.
 | v2-bird | `bird_v2` | CatBoost con 56 features (dataset v2), sin recompra; puntúa todo el catálogo |
 | v3-bird | `bird_blend_rank` | `personal_v5` propone 50 candidatos y el modelo de ranking (YetiRank) los ordena |
 | v4-bird | `bird_two_stage` | Doble modelo sin heurística: el clasificador de v2-bird elige 50 candidatos y un ranking con features de lista (dataset v3) los ordena |
+| v5-bird | `bird_v5` | El modelo de v2-bird (sin recompra) con el dataset v5: 81 features invariantes al volumen de tráfico + promociones, tendencias, feedback propio y contexto; entrenado con histórico + feedback en vivo |
 
 El nombre de versión funciona como política: `make dry POLICY=v3-bird`, `make up AB=<otros brazos>,v3-bird=v3-bird`.
 Código en `reco/bird/` y `reco/policies/bird.py`; entrenamiento y evaluación con `scripts/bird.py` y
-`scripts/bird_blend.py`. La siguiente versión será **v5-bird**.
+`scripts/bird_blend.py`. La siguiente versión será **v6-bird**.
+
+### Dataset v5 (v5-bird)
+- Features, justificación, medidas y fuentes: `docs/DATASET_V5.md`. Fórmulas en `reco/bird/feat5.py`: **una sola
+  implementación** para entrenar (`build_v5.py`) y servir (`live5.py`); una feature nueva se añade ahí y en `V5`
+  (`schema.py`), no en dos sitios.
+- `python scripts/bird_v5.py dataset [--refresh-live]` · `compare` (v2 frente a v5 con las mismas filas) ·
+  `train --name v5_fresh` (solo histórico < 07/11, para `make offline`) · `train --name v5_live --final`
+  (producción: histórico + vivo) · `offline` (los dos tests solo para `bird_v2` y `bird_v5`) · `state` · `parity`.
+- Antes de servir `v5-bird`: `python scripts/bird_v5.py state` (descarga `data/bird/state5_live/`, ~2 min).
+- Ninguna feature de v5 puede ser un recuento absoluto: el vivo tiene ~29 veces más eventos por hora que el
+  histórico. Cuotas, cocientes o lifts suavizados (`tests/test_bird_v5.py` lo comprueba).
 
 ## Fiabilidad de la evaluación offline (14/11, 8 versiones servidas)
 Verdad: conversión **esperada** de cada `model_version` en el leaderboard (`/api/state?by=model`, sin suerte).

@@ -98,4 +98,34 @@ V3_RANK = FeatureSchema(version="v3_rank", features=STAGE2_LIST + STAGE2_DIRECT 
                         categorical=("page",), per_request=STAGE2_LIST + STAGE2_DIRECT,
                         metadata=_META_V2 + ("already_purchased", "cold_sim"))
 
-SCHEMAS = {s.version: s for s in (V1, V2, V2_NOREBUY, V3_RANK)}
+# ── v5: dataset de reco/bird/build_v5.py (histórico + feedback en vivo). Fórmulas en reco/bird/feat5.py ──
+# Mismo modelo que v2-bird sin recompra; cambian las features: todas invariantes al volumen de tráfico
+# (cuotas y cocientes en vez de recuentos) y señales que solo existen en vivo (promoción, tendencia de la
+# última hora, respuesta en nuestro carrusel, qué compra cada dispositivo / región).
+V5_ITEM = ("price_eur", "it_price_vs_sub", "it_age_days", "it_discount",
+           "it_buy_share", "it_view_share", "it_buy_rate", "it_cart_rate", "it_buy_share_7d", "it_view_share_7d",
+           "it_buy_share_1d", "it_trend_1d", "it_trend_1h", "it_sub_rank",
+           "it_c_ctr", "it_c_cvr", "it_fb_click_lift", "it_fb_buy_lift")
+V5_CTX = ("ctx_dev_item", "ctx_dev_sub", "ctx_dev_cat", "ctx_dev_brand", "ctx_dev_attr", "ctx_dev_price",
+          "ctx_reg_item", "ctx_reg_sub", "ctx_reg_cat", "ctx_reg_attr")
+V5_SESSION = SESSION + ("sv_secs_since_last", "sv_attr_last", "sv_attr_w", "sv_sub_w", "sv_cat_w",
+                        "sv_logp_diff_last", "sv_n_subs")
+V5_USER = ("is_new_user", "u_hist_conf", "u_buy_ratio", "u_logp_diff", "u_buy_logp_diff", "u_logp_z")
+V5_AFFINITY = ("u_sub_share", "u_brand_share", "u_cat_share", "u_attr_share", "u_attr_max_share",
+               "u_attr_min_share", "u_sub_share_rec", "u_cat_share_rec", "u_attr_share_rec", "u_sub_buy_share",
+               "u_brand_buy_share", "u_cat_buy_share", "u_attr_buy_share")
+GROUPS_V5 = {"producto": ITEM_CAT + V5_ITEM, "contexto": CONTEXT + V5_CTX, "sesion": V5_SESSION,
+             "usuario": V5_USER, "afinidad": V5_AFFINITY, "usuario_x_producto": PAIR, "posicion": ("position",)}
+_META_V5 = _META_V2 + ("source", "served_by", "already_purchased")
+
+
+def _v5(version: str, drop: tuple[str, ...] = ()) -> FeatureSchema:
+    per_request = tuple(f for f in CONTEXT + V5_CTX + V5_SESSION + V5_USER + V5_AFFINITY + PAIR if f not in drop)
+    item = tuple(f for f in ITEM_CAT + V5_ITEM if f not in drop)
+    return FeatureSchema(version=version, features=item + per_request + ("position",),
+                         categorical=ITEM_CAT + CONTEXT, per_request=per_request, metadata=_META_V5)
+
+
+V5 = _v5("v5")
+
+SCHEMAS = {s.version: s for s in (V1, V2, V2_NOREBUY, V3_RANK, V5)}

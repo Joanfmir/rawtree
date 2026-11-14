@@ -89,20 +89,24 @@ class BirdV2(Policy):
     refresh_every = 120.0
     STATE_EVERY = 1800.0
     top = 30   # finalize() se queda con los 10 primeros válidos; el margen evita rellenar con best sellers
+    state_script = "bird.py"   # script cuyo comando `state` vuelve a descargar el estado de usuarios
+
+    def _load_state(self, until):
+        from ..bird.live import LiveState
+        return LiveState.load(until)
 
     def fit(self, state):
         import threading
         import time
 
-        from ..bird.live import LiveState
         from ..config import DATA_DIR
         folder = self.folder or DATA_DIR / "bird" / self.model_name
         final = DATA_DIR / "bird" / self.final_name
         if self.folder is None and not self.until and (final / "model.cbm").exists():
             folder = final   # en vivo: el modelo entrenado con todos los datos, si existe
         self.model = BirdModel.load(folder)
-        print(f"[bird_v2] modelo {folder.name} ({self.model.info.get('trees', '?')} árboles)")
-        self.live = LiveState.load(self.until)
+        print(f"[{self.name}] modelo {folder.name} ({self.model.info.get('trees', '?')} árboles)")
+        self.live = self._load_state(self.until)
         self._sold: dict[str, frozenset[str]] = {}
         self._valid: tuple[tuple[int, int], np.ndarray] | None = None
         self._state_at = time.monotonic()
@@ -121,7 +125,6 @@ class BirdV2(Policy):
         import sys
         import time
 
-        from ..bird.live import LiveState
         from ..client import query
         from ..config import ROOT, TEAM
         try:   # lo que nuestro carrusel ya ha vendido en vivo
@@ -134,17 +137,17 @@ class BirdV2(Policy):
                 sold.setdefault(r["u"], set()).add(r["p"])
             self._sold = {u: frozenset(p) for u, p in sold.items()}
         except Exception as e:
-            print(f"[bird_v2] ventas en vivo no actualizadas: {e}")
+            print(f"[{self.name}] ventas en vivo no actualizadas: {e}")
         if time.monotonic() - self._state_at >= self.STATE_EVERY:
             self._state_at = time.monotonic()
             try:
                 t = time.time()
-                subprocess.run([sys.executable, str(ROOT / "scripts" / "bird.py"), "state"], cwd=ROOT, check=True,
-                               capture_output=True, timeout=1500)
-                self.live = LiveState.load(None)   # cambio atómico
-                print(f"[bird_v2] estado de usuarios recargado en {time.time() - t:.0f}s")
+                subprocess.run([sys.executable, str(ROOT / "scripts" / self.state_script), "state"], cwd=ROOT,
+                               check=True, capture_output=True, timeout=1500)
+                self.live = self._load_state(None)   # cambio atómico
+                print(f"[{self.name}] estado de usuarios recargado en {time.time() - t:.0f}s")
             except Exception as e:
-                print(f"[bird_v2] recarga del estado falló, sigo con el anterior: {e}")
+                print(f"[{self.name}] recarga del estado falló, sigo con el anterior: {e}")
 
     def _valid_mask(self, state, live) -> np.ndarray:
         snap = state.snapshot()
@@ -179,6 +182,38 @@ class BirdV2(Policy):
         if ok.any():
             out[ok] = self.model.predict_matrices(*live.matrices(req, self.model.schema, rows[ok]))
         return out
+
+
+class BirdV5(BirdV2):
+    """Política "bird_v5" (v5-bird): el modelo de v2-bird (CatBoost, P(compra), sin recompra) con el dataset v5.
+
+    Qué cambia respecto a v2-bird (docs/DATASET_V5.md): features invariantes al volumen de tráfico, promoción
+    (precio actual frente al precio base), tendencia de la última hora, respuesta de cada producto en nuestro
+    carrusel, qué compra cada dispositivo / región, más detalle de la sesión y de la afinidad del usuario; y
+    se entrena también con nuestro feedback en vivo. Las features se calculan con las MISMAS funciones al
+    entrenar y al servir (reco/bird/feat5.py).
+    Cada refresco (2 min) actualiza catálogo, promociones, tendencias y feedback con 3 consultas de segundos;
+    la historia de los usuarios se vuelve a descargar cada STATE_EVERY s en un proceso aparte.
+    """
+    name = "bird_v5"
+    model_name = "v5_fresh"   # solo histórico anterior al 07/11: el que se evalúa offline
+    final_name = "v5_live"    # histórico + feedback en vivo: el que se sirve
+    state_script = "bird_v5.py"
+
+    def _load_state(self, until):
+        from ..bird.live5 import LiveState5
+        return LiveState5.load(until)
+
+    def _refresh_background(self) -> None:
+        import time
+        super()._refresh_background()
+        try:
+            t = time.time()
+            self.live = self.live.with_items()   # cambio atómico: recommend() usa el estado que cogió al empezar
+            if time.time() - t > 20:
+                print(f"[{self.name}] refresco de producto lento: {time.time() - t:.0f}s")
+        except Exception as e:
+            print(f"[{self.name}] refresco de producto falló, sigo con el anterior: {e}")
 
 
 class BirdRank(BirdV2):
