@@ -6,6 +6,7 @@
     f = features.load(until="2026-11-07")   # dict nombre -> DataFrame
 
 Tablas:
+    item_live        solo live: ventanas cortas, precio/stock actual y trend_score (compras 7d/h)
     item_features    una fila por producto: catálogo + popularidad + tasa de compra
     user_subcat      usuario -> sus 10 subcategorías favoritas (peso: compra 5, carrito 3, vista 1)
     user_brand       usuario -> sus 5 marcas favoritas
@@ -64,7 +65,7 @@ def _last_day(until: str | None) -> str:
 
 def queries(until: str | None) -> dict[str, str]:
     E, NOW = _events(until), _last_day(until)
-    return {
+    tables = {
         "item_features": f"""
             SELECT c.product_id AS product_id, c.category AS category, c.subcategory AS subcategory,
                    c.brand AS brand, c.price_eur AS price_eur, c.is_active AS is_active, c.is_new AS is_new,
@@ -127,6 +128,63 @@ def queries(until: str | None) -> dict[str, str]:
             FROM {E} WHERE event_type = 'purchase' AND ts > {NOW} - INTERVAL 14 DAY
             GROUP BY device, region, product_id ORDER BY n DESC LIMIT 50 BY device, region""",
     }
+    if until is None:
+        tables["item_live"] = ITEM_LIVE
+    return tables
+
+
+# Solo live: instantánea SQL; no consulta por petición. El backtest favorece pop_7d.
+ITEM_LIVE = """
+WITH now64(3) AS instante,
+versiones AS (
+    SELECT product_id::String AS product_id, price_eur::Float64 AS precio,
+           is_active::Bool AS activo, toDateTime64('1970-01-01', 3) AS ts
+    FROM shop.catalog
+    UNION ALL
+    SELECT product_id::String, price_eur::Float64, is_active::Bool, ts::DateTime64(3)
+    FROM shop.catalog_updates WHERE ts::DateTime64(3) <= instante
+), secuencia AS (
+    SELECT *, lagInFrame(precio, 1, precio) OVER (
+        PARTITION BY product_id ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS anterior FROM versiones
+), catalogo AS (
+    SELECT product_id, argMax(precio, ts) AS price_eur,
+           argMin(precio, ts) AS initial_price_eur, argMax(activo, ts) AS in_stock,
+           maxIf(ts, precio < anterior) AS ultima_bajada
+    FROM secuencia GROUP BY product_id
+), recientes AS (
+    SELECT product_id::String AS product_id,
+           countIf(event_type::String = 'purchase' AND ts::DateTime64(3) > instante - INTERVAL 60 MINUTE) AS purchases_60m,
+           countIf(event_type::String = 'view' AND ts::DateTime64(3) > instante - INTERVAL 60 MINUTE) AS views_60m,
+           countIf(event_type::String = 'purchase') AS purchases_3h,
+           countIf(event_type::String = 'view') AS views_3h
+    FROM shop.events
+    WHERE ts::DateTime64(3) > instante - INTERVAL 3 HOUR AND ts::DateTime64(3) <= instante
+    GROUP BY product_id
+), semana AS (
+    SELECT product_id, sum(n) AS n FROM (
+        SELECT product_id::String AS product_id, count() AS n FROM shop.history_events
+        WHERE event_type::String = 'purchase' AND ts::DateTime64(3) > instante - INTERVAL 7 DAY
+          AND ts::DateTime64(3) <= instante GROUP BY product_id
+        UNION ALL
+        SELECT product_id::String, count() FROM shop.events
+        WHERE event_type::String = 'purchase' AND ts::DateTime64(3) > instante - INTERVAL 7 DAY
+          AND ts::DateTime64(3) <= instante GROUP BY product_id
+    ) GROUP BY product_id
+)
+SELECT c.product_id AS product_id,
+       coalesce(r.purchases_60m, 0) AS purchases_60m, coalesce(r.views_60m, 0) AS views_60m,
+       coalesce(r.purchases_3h, 0) AS purchases_3h, coalesce(r.views_3h, 0) AS views_3h,
+       c.price_eur AS price_eur, c.initial_price_eur AS initial_price_eur,
+       c.price_eur / nullIf(c.initial_price_eur, 0) AS price_ratio,
+       if(c.ultima_bajada = toDateTime64('1970-01-01', 3), NULL,
+          dateDiff('second', c.ultima_bajada, instante) / 60.0) AS minutes_since_price_drop,
+       c.in_stock AS in_stock, coalesce(s.n, 0) / 168.0 AS trend_score,
+       instante AS as_of
+FROM catalogo AS c LEFT JOIN recientes AS r ON c.product_id = r.product_id
+LEFT JOIN semana AS s ON c.product_id = s.product_id
+"""
+
 
 
 def folder(until: str | None) -> Path:

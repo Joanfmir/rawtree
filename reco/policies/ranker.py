@@ -98,3 +98,22 @@ class Ranker(Policy):
         X = fz.matrix(req, user, cand)
         score = self.model.predict(X, num_threads=1) + self.cat_boost * (X[:, SAME_CAT] == 1)
         return list(fz.ids[cand[np.argsort(-score)[:10]]])
+
+
+class RankerFeedback(Ranker):
+    """Ranker de feedback real; sin refuerzo manual, ya aprendido por el modelo.
+
+    Conserva la exclusión de recompra y el refresco de candidatos de gulias.
+    El entrenamiento se ejecuta fuera del servidor; el modelo se carga al arrancar.
+    """
+    name = "gulias_fb"
+    cat_boost = 0.0
+
+    def fit(self, state):
+        super().fit(state)
+        path = DATA_DIR / "ranker_live_fb.txt"
+        if not self.until and path.exists():
+            self.cat_boost = 0.0
+            self.model = lgb.Booster(model_file=str(path))
+        else:
+            self.cat_boost = Ranker.cat_boost

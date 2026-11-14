@@ -43,7 +43,14 @@ V1 = {
 }
 # v2: prioriza las categorías de la sesión.
 V2 = {**V1, "cat_fill": 0.5, "off": 0.0}
-VERSIONS = {"v1": V1, "v2": V2}
+# v3: lo que predice la compra EN VIVO (197.670 impresiones nuestras, 14/11). Dentro de la categoría vista
+# manda la calidad general del producto (el cuartil alto de popularidad/tasa de compra convierte ~7-10× el
+# bajo), lo recién visto duplica y los vecinos de co-compra ayudan; la afinidad del usuario (subcategoría,
+# marca) y la recompra orgánica no aportan. Así que: categoría (ponderada por su peso en las vistas),
+# populares de esa categoría, recién visto y co-compra; sin señales de perfil.
+V3 = {**V2, "user": 0.0, "brand": 0.0, "rebuy": 0.0, "cat_fill": 2.0, "self": 1.0, "buy": 1.0, "view": 0.1,
+      "ctx": 0.3, "pop": 0.4, "cat_share": 1.0}
+VERSIONS = {"v1": V1, "v2": V2, "v3": V3}
 DEFAULT_WEIGHTS = V2
 
 
@@ -187,7 +194,10 @@ class Personal(Policy):
             for k, v in enumerate(reversed(views)):
                 c = ix.cat_of.get(v)
                 if c is not None:
-                    cats[c] = max(cats.get(c, 0.0), w["cat_decay"] ** k)
+                    if w.get("cat_share"):   # peso = fracción de las vistas que son de esa categoría
+                        cats[c] = cats.get(c, 0.0) + 1 / len(views)
+                    else:
+                        cats[c] = max(cats.get(c, 0.0), w["cat_decay"] ** k)
             for c, a in cats.items():
                 for q, n in ix.cat_top.get(c, ()):
                     s[q] += w["cat_fill"] * a * n
@@ -206,6 +216,12 @@ class Personal(Policy):
                     else:
                         del s[q]
         return sorted((p for p in s if math.isfinite(s[p])), key=s.get, reverse=True)[:10]
+
+
+class PersonalV3(Personal):
+    """Categoría + calidad del producto + recién visto + co-compra, sin perfil de usuario (ver V3)."""
+    name = "personal_v3"
+    version = "v3"
 
 
 class PersonalV1(Personal):
