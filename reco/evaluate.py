@@ -55,6 +55,14 @@ def load_sessions(until: str = DEFAULT_UNTIL) -> pd.DataFrame:
     return df
 
 
+def drop_rebuys(df: pd.DataFrame, user_purchases: pd.DataFrame) -> pd.DataFrame:
+    """Quita los carruseles cuya compra (o clic) es un producto que el usuario ya había comprado.
+    El simulador en vivo penaliza la recompra, así que no queremos premiar a quien la explota."""
+    bought = set(zip(user_purchases.user_id, user_purchases.product_id))
+    target = np.where(df.purchased != "", df.purchased, df.clicked)
+    return df[[(u, p) not in bought for u, p in zip(df.user_id, target)]].reset_index(drop=True)
+
+
 def make_state(until: str, feats: dict[str, pd.DataFrame]) -> State:
     """Estado como el de producción, pero con el catálogo y best sellers de antes del corte."""
     items = feats["item_features"]
@@ -117,12 +125,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--policies", nargs="*", default=["baseline", "coview", "personal"])
     ap.add_argument("--until", default=DEFAULT_UNTIL)
+    ap.add_argument("--with-rebuy", action="store_true",
+                    help="incluir las compras que son recompras (por defecto se excluyen del test)")
     args = ap.parse_args()
 
     if not features.folder(args.until).exists():
         features.build(until=args.until)
     feats = features.load(until=args.until)
     df = load_sessions(args.until)
+    if not args.with_rebuy:
+        df = drop_rebuys(df, feats["user_purchases"])
     state = make_state(args.until, feats)
     known = set(feats["user_subcat"].user_id)
     print(f"Test desde {args.until}: {len(df)} carruseles con clic, {(df.purchased != '').sum()} con compra\n")
