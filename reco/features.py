@@ -14,6 +14,7 @@ Tablas:
     item_neighbors   producto -> productos relacionados (kind = 'buy': miró p y compró q en la sesión;
                      kind = 'view': vistos en la misma sesión)
     user_items       hasta 3 pares útiles por usuario; vistas/carritos/compras/clics por origen
+    item_feedback    (solo en vivo) producto × posición en nuestro carrusel: impresiones, clics, compras
     user_stats       usuario -> nº de eventos, nº de compras y nivel de precio (log) que mira / compra
     user_cat         usuario -> peso por categoría (compra 5, carrito 3, vista 1)
     context_popular  (device, region) -> 50 productos más comprados (para usuarios nuevos)
@@ -177,7 +178,43 @@ def queries(until: str | None) -> dict[str, str]:
     }
     if until is None:
         tables["item_live"] = ITEM_LIVE
+        tables["item_feedback"] = item_feedback_query()
     return tables
+
+
+# Tablas que pueden fallar sin tumbar el refresco: si su consulta falla se conserva el Parquet anterior.
+OPTIONAL = {"item_feedback"}
+
+
+def item_feedback_query() -> str:
+    """Lo que pasó con cada producto en NUESTRO carrusel, por posición: impresiones, clics y compras.
+    Es lo único que mide directamente lo que premia el simulador (la historia orgánica no lo hace)."""
+    from .config import TEAM
+    return f"""
+        SELECT x.1 AS product_id, x.2 AS slot, count() AS impressions,
+               countIf(clicked::String = x.1) AS clicks, countIf(purchased::String = x.1) AS purchases
+        FROM (SELECT arrayJoin(arrayZip(shown::Array(String), arrayEnumerate(shown::Array(String)))) AS x,
+                     clicked, purchased
+              FROM {TEAM}.feedback WHERE request_id::String != '__init__')
+        GROUP BY product_id, slot"""
+
+
+def feedback_lift(fb: pd.DataFrame | None, prior: float = 3.0) -> dict[str, float]:
+    """{producto: lift}: cuánto más (o menos) de lo esperado convierte un producto en nuestro carrusel.
+
+    valor = clics + 2·compras. Esperado = lo que habría conseguido un producto medio en esas mismas
+    posiciones (así no se premia a quien salió arriba). lift = (valor + prior) / (esperado + prior):
+    con pocas impresiones se queda en ~1 y solo se aleja cuando hay evidencia. Acotado a [0,3, 3]."""
+    if fb is None or not len(fb):
+        return {}
+    fb = fb.assign(value=fb.clicks.astype(float) + 2.0 * fb.purchases.astype(float),
+                   impressions=fb.impressions.astype(float))
+    by_slot = fb.groupby("slot")[["value", "impressions"]].sum()
+    rate = (by_slot.value / by_slot.impressions.clip(lower=1)).to_dict()
+    fb = fb.assign(expected=fb.impressions * fb.slot.map(rate).fillna(0.0))
+    agg = fb.groupby("product_id")[["value", "expected"]].sum()
+    lift = ((agg.value + prior) / (agg.expected + prior)).clip(0.3, 3.0)
+    return lift.to_dict()
 
 
 # Solo live: instantánea SQL; no consulta por petición. El backtest favorece pop_7d.
@@ -246,7 +283,13 @@ def build(until: str | None = None, only: list[str] | None = None, verbose: bool
         if only and name not in only:
             continue
         t = time.time()
-        df = pd.DataFrame(query(sql, timeout=900))
+        try:
+            df = pd.DataFrame(query(sql, timeout=900))
+        except Exception as e:
+            if name not in OPTIONAL:
+                raise
+            print(f"  {name}: no actualizada ({e})")
+            continue
         # Reemplazo atómico: un lector concurrente nunca abre un Parquet a medio escribir.
         fd, tmp = tempfile.mkstemp(prefix=f".{name}-", suffix=".tmp", dir=out_dir)
         os.close(fd)

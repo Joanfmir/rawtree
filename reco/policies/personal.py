@@ -52,7 +52,20 @@ V3 = {**V2, "user": 0.0, "brand": 0.0, "rebuy": 0.0, "cat_fill": 2.0, "self": 1.
       "ctx": 0.3, "pop": 0.4, "cat_share": 1.0,
       # historial por producto (ver recommend): lo comprado en carrusel va arriba del todo
       "hist_carousel": 4.0, "hist_cart": 1.5, "hist_click": 1.2, "organic": 0.1}
-VERSIONS = {"v1": V1, "v2": V2, "v3": V3}
+# v4: v3 + dos cambios respaldados por el feedback en vivo (14/11, 39.341 peticiones).
+#   organic = 0  lo comprado solo de forma orgánica se descarta: en vivo, 2 compras en 24.457 impresiones
+#                (0,04-0,18× lo esperado por posición). Offline sin recompras: ndcg 0,416 → 0,422.
+#   fb           × lift^fb: lift del producto en nuestro propio carrusel (features.feedback_lift).
+#                Validado con partición temporal: lift < 0,6 → convierte 0,6×; lift > 1,1 → 1,2×.
+#                Exponente < 1 porque el lift predicho exagera algo el real.
+# Probado y DESCARTADO (el código queda, con peso 0):
+#   cat_recency  pesar las categorías por recencia (r^k). Offline mejora (ndcg 0,416 → 0,430), pero es un
+#                sesgo del log (el sistema viejo solo enseñaba la categoría de la última vista): en vivo,
+#                con 2+ categorías vistas, la de una vista ANTERIOR convierte 1,98× y la de la última 1,17×.
+#   sub_fill     más vendidos de la subcategoría vista. Peor offline (0,416 → 0,381) y en vivo la
+#                subcategoría de la última vista no convierte más que el resto de su categoría.
+V4 = {**V3, "organic": 0.0, "fb": 0.7, "cat_recency": 0.0, "sub_fill": 0.0}
+VERSIONS = {"v1": V1, "v2": V2, "v3": V3, "v4": V4}
 DEFAULT_WEIGHTS = V2
 
 
@@ -138,6 +151,9 @@ class Personal(Policy):
         ix.subcat_top = _norm_lists(items, "subcategory", "product_id", "pop", 10)
         ix.cat_of = dict(zip(items.product_id, items.category))
         ix.cat_top = _norm_lists(items, "category", "product_id", "pop", 40)
+        ix.subcat_of = dict(zip(items.product_id, items.subcategory))
+        from ..features import feedback_lift
+        ix.fb_lift = feedback_lift(f.get("item_feedback"))
 
         nb = f["item_neighbors"]
         ix.nb_buy = _norm_lists(nb[nb.kind == "buy"], "p", "q", "n", 20)
@@ -222,22 +238,42 @@ class Personal(Policy):
 
         # Categorías de la sesión: relleno dentro de categoría y penalización (o descarte) de lo de fuera
         cats: dict[str, float] = {}
+        rec = w.get("cat_recency", 0.0)   # v4: peso de la vista k-ésima más antigua = rec^k (normalizado)
+        rec_total = sum(rec ** k for k in range(len(views))) if rec and views else 0.0
         if views and (w["cat_fill"] or w["off"] != 1):
             for k, v in enumerate(reversed(views)):
                 c = ix.cat_of.get(v)
                 if c is not None:
-                    if w.get("cat_share"):   # peso = fracción de las vistas que son de esa categoría
+                    if rec:
+                        cats[c] = cats.get(c, 0.0) + rec ** k / rec_total
+                    elif w.get("cat_share"):   # peso = fracción de las vistas que son de esa categoría
                         cats[c] = cats.get(c, 0.0) + 1 / len(views)
                     else:
                         cats[c] = max(cats.get(c, 0.0), w["cat_decay"] ** k)
             for c, a in cats.items():
                 for q, n in ix.cat_top.get(c, ()):
                     s[q] += w["cat_fill"] * a * n
+        if views and w.get("sub_fill"):   # v4: más vendidos de las subcategorías vistas
+            for k, v in enumerate(reversed(views)):
+                a = rec ** k / rec_total if rec else 1 / len(views)
+                for q, n in ix.subcat_top.get(ix.subcat_of.get(v), ()):
+                    s[q] += w["sub_fill"] * a * n
 
         brands = ix.user_brand.get(user)
         if brands:
             for q in s:
                 s[q] *= 1 + w["brand"] * brands.get(ix.brand_of.get(q), 0)
+
+        if w.get("fb") and ix.fb_lift:   # v4: lo que el producto ha demostrado en nuestro carrusel
+            fb, lift = w["fb"], ix.fb_lift
+            for q in s:
+                x = lift.get(q)
+                if x is not None:
+                    s[q] *= x ** fb
+
+        if w.get("organic", 1.0) == 0.0:   # v4: fuera lo comprado solo de forma orgánica
+            for q in ix.user_organic.get(user, ()):
+                s.pop(q, None)
 
         if cats and w["off"] != 1:
             off = w["off"]
@@ -254,6 +290,12 @@ class PersonalV3(Personal):
     """Categoría + calidad del producto + recién visto + co-compra, sin perfil de usuario (ver V3)."""
     name = "personal_v3"
     version = "v3"
+
+
+class PersonalV4(Personal):
+    """v3 + recencia de categoría, subcategoría, descarte de lo orgánico y lift del feedback (ver V4)."""
+    name = "personal_v4"
+    version = "v4"
 
 
 class PersonalV1(Personal):
