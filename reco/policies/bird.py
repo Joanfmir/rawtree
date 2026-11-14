@@ -228,3 +228,46 @@ class BirdBlendRank(BirdBlend):
     """La misma mezcla con el modelo de ranking: empata en ips_ndcg y va algo mejor con usuarios nuevos."""
     name = "bird_blend_rank"
     bird_class = BirdRank
+
+
+class BirdTwoStage(BirdV2):
+    """Política "bird_two_stage" (v4-bird): dos modelos de CatBoost seguidos, sin heurística.
+
+      1. selector   el clasificador de bird_v2 puntúa todo el catálogo y se queda con los `n` mejores
+      2. ordenador  un modelo de ranking (dataset v3) decide el orden usando las features de lista de
+                    reco/bird/stage2.py: qué opina el selector, cómo queda el producto frente a los demás
+                    candidatos, redundancia, y unas pocas señales directas
+
+    Mismas exclusiones que bird_v2 (activo, en stock, nunca lo ya comprado).
+    """
+    name = "bird_two_stage"
+    ranker_name = "v3_rank"            # ordenador validado (para evaluar offline)
+    ranker_final = "v3_rank_live"      # ordenador entrenado con todos los datos (solo en vivo, si existe)
+    n = 50
+
+    def fit(self, state):
+        from ..config import DATA_DIR
+        super().fit(state)
+        folder = DATA_DIR / "bird" / self.ranker_name
+        final = DATA_DIR / "bird" / self.ranker_final
+        if not self.until and (final / "model.cbm").exists():
+            folder = final
+        self.ranker = BirdModel.load(folder)
+        print(f"[{self.name}] ordenador {folder.name} ({self.ranker.info.get('trees', '?')} árboles)")
+
+    def recommend(self, req, state):
+        from ..bird import stage2
+        live = self.live
+        mask = self._valid_mask(state, live).copy()
+        mask[live.bought(live.user(req))] = False
+        for p in self._sold.get(req.get("user_id"), ()):
+            i = live.idx.get(p)
+            if i is not None:
+                mask[i] = False
+        if not mask.any():
+            return []
+        cols, prob, chosen = stage2.select(live, self.model, req, mask, size=self.n)
+        feats = {**stage2.list_features(live, cols, prob, chosen, chosen), **stage2.direct_features(cols, chosen),
+                 "position": np.full(len(chosen), float(self.ranker.schema.reference_position))}
+        score = self.ranker.predict(pd.DataFrame(feats))
+        return live.ids[chosen[np.argsort(-score, kind="stable")[:self.top]]].tolist()
