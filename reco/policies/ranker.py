@@ -35,10 +35,11 @@ class Ranker(Policy):
     name = "gulias"
     refresh_every = 120.0
     cat_boost = 1.0
+    model_tag = ""     # sufijo del fichero del modelo (experimentos)
 
     def fit(self, state):
         self.fz = Featurizer(self.load_features())
-        path = DATA_DIR / (f"ranker_until_{self.until}.txt" if self.until else "ranker_live.txt")
+        path = DATA_DIR / ((f"ranker_until_{self.until}" if self.until else "ranker_live") + f"{self.model_tag}.txt")
         self.model = lgb.Booster(model_file=str(path))
         self._live_bought: frozenset[tuple[str, str]] = frozenset()
         self._rebuilt_at = time.monotonic()
