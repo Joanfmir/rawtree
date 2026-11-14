@@ -1,0 +1,31 @@
+{
+  "requests": 5000,
+  "catalog": 5100,
+  "unavailable": 36,
+  "policies": {
+    "personal_v1": {
+      "invalid": [],
+      "errors": [],
+      "completed": 5000,
+      "p50_ms": 0.222667,
+      "p99_ms": 1.8841833300000013,
+      "max_ms": 34.884125
+    },
+    "personal": {
+      "invalid": [],
+      "errors": [],
+      "completed": 5000,
+      "p50_ms": 0.2437705,
+      "p99_ms": 0.9573386700000011,
+      "max_ms": 10.225125
+    },
+    "gulias": {
+      "invalid": [],
+      "errors": [],
+      "completed": 5000,
+      "p50_ms": 3.8605205,
+      "p99_ms": 8.605920170000008,
+      "max_ms": 15.711875
+    }
+  }
+}

@@ -34,7 +34,8 @@ DECAY = 0.6
 
 
 def _views(req) -> list[str]:
-    return [v["product_id"] for v in (req.get("recent_views") or []) if v and v.get("product_id")]
+    return [v["product_id"] for v in (req.get("recent_views") or [])
+            if isinstance(v, dict) and isinstance(v.get("product_id"), str) and v["product_id"]]
 
 
 class Featurizer:
@@ -42,7 +43,7 @@ class Featurizer:
         it = feats["item_features"].copy()
         for c in ("views", "carts", "purchases", "views_7d", "purchases_7d", "purchases_1d"):
             it[c] = it[c].fillna(0).astype(float)
-        it["price_eur"] = it.price_eur.fillna(it.price_eur.median()).astype(float)
+        it["price_eur"] = pd.to_numeric(it.price_eur, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(it.price_eur.median() if it.price_eur.notna().any() else 0).astype(float).clip(lower=0)
         self.ids = it.product_id.to_numpy()
         self.idx = {p: i for i, p in enumerate(self.ids)}
         n = len(it)
@@ -103,7 +104,7 @@ class Featurizer:
         ub = ub.assign(a=ub.w / ub.groupby("user_id").w.transform("max"))
         self.user_brand = {u: dict(zip(g.brand, g.a)) for u, g in ub.groupby("user_id", sort=False)}
         st = feats["user_stats"]
-        self.user_stats = {u: (np.log1p(n), lp if lp == lp else lpa)
+        self.user_stats = {u: (np.log1p(max(n, 0) if pd.notna(n) else 0), lp if pd.notna(lp) else (lpa if pd.notna(lpa) else 0.0))
                            for u, n, lp, lpa in zip(st.user_id, st.n_events, st.buy_logp, st.avg_logp)}
         up = feats["user_purchases"]
         self.bought: dict[str, set[int]] = defaultdict(set)
@@ -213,4 +214,4 @@ class Featurizer:
         X[:, 28] = PAGES.get(ctx.get("page"), -1)
         X[:, 29] = DEVICES.get(ctx.get("device"), -1)
         X[:, 30] = 0 if pos is None else pos
-        return X
+        return np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)

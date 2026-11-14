@@ -40,30 +40,38 @@ class Ranker(Policy):
         self.fz = Featurizer(self.load_features())
         path = DATA_DIR / (f"ranker_until_{self.until}.txt" if self.until else "ranker_live.txt")
         self.model = lgb.Booster(model_file=str(path))
-        self._live_bought: set[tuple[str, str]] = set()
-        self._rebuilt_at = time.time()
+        self._live_bought: frozenset[tuple[str, str]] = frozenset()
+        self._rebuilt_at = time.monotonic()
         self._thread: threading.Thread | None = None
 
     def refresh(self, state):
         if self.until:
             return
-        self._add_live_purchases()
-        busy = self._thread is not None and self._thread.is_alive()
-        if not busy and time.time() - self._rebuilt_at >= FEATURES_EVERY:
-            self._rebuilt_at = time.time()
-            self._thread = threading.Thread(target=self._rebuild, daemon=True)
-            self._thread.start()
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._refresh_background, daemon=True)
+        self._thread.start()
+
+    def _refresh_background(self) -> None:
+        """Ni la red ni la reconstrucción bloquean el bucle de respuestas."""
+        try:
+            self._add_live_purchases()
+        except Exception as e:
+            print(f"[ranker] compras en vivo no actualizadas: {e}")
+        if time.monotonic() - self._rebuilt_at >= FEATURES_EVERY:
+            self._rebuilt_at = time.monotonic()
+            self._rebuild()
 
     def _add_live_purchases(self) -> None:
         """Lo que nuestros carruseles han vendido no se vuelve a ofrecer a ese usuario."""
         rows = query(f"""SELECT r.user_id::String AS u, f.purchased::String AS p
                          FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r
                            ON r.request_id::String = f.request_id::String
-                         WHERE f.purchased::String != ''""", timeout=30)
-        self._live_bought |= {(r["u"], r["p"]) for r in rows}
-        for u, p in self._live_bought:
-            if p in self.fz.idx:
-                self.fz.bought[u].add(self.fz.idx[p])
+                         WHERE f.purchased::String != '' AND f.request_id::String != '__init__'
+                           AND f.ts::DateTime64(3) >= now64(3) - INTERVAL 2 DAY
+                         ORDER BY f.ts::DateTime64(3) DESC LIMIT 500000""", timeout=30)
+        # Publicación inmutable: recommend nunca observa un set en plena modificación.
+        self._live_bought = frozenset((r["u"], r["p"]) for r in rows)
 
     def _rebuild(self) -> None:
         try:
@@ -73,9 +81,6 @@ class Ranker(Policy):
             subprocess.run([sys.executable, str(ROOT / "scripts" / "build_features.py")], cwd=ROOT,
                            check=True, capture_output=True, timeout=900)
             fz = Featurizer(features.load(until=None))
-            for u, p in self._live_bought:
-                if p in fz.idx:
-                    fz.bought[u].add(fz.idx[p])
             self.fz = fz   # cambio atómico: recommend() usa el nuevo a partir de aquí
             print(f"[ranker] features recalculadas en {time.time() - t:.0f}s")
         except Exception as e:
@@ -85,7 +90,9 @@ class Ranker(Policy):
         fz = self.fz
         user = None if req.get("is_new_user") else req.get("user_id")
         cand = fz.candidates(req, user)
-        cand = cand[np.array([state.is_valid(p) for p in fz.ids[cand]], dtype=bool)]
+        bought = self._live_bought
+        cand = cand[np.array([state.is_valid(p) and (user, p) not in bought
+                              for p in fz.ids[cand]], dtype=bool)]
         if len(cand) == 0:
             return []
         X = fz.matrix(req, user, cand)

@@ -16,7 +16,7 @@ FROM (
     FROM shop.catalog
     UNION ALL
     SELECT product_id::String, category::String, subcategory::String, brand::String, price_eur::Float64,
-           is_active::Bool, toUInt8(change::String = 'new_product'), toString(ts)
+           is_active::Bool, toUInt8(change::String = 'new_product'), toString(ts::DateTime64(3))
     FROM shop.catalog_updates
 )
 GROUP BY product_id"""
@@ -44,7 +44,10 @@ def current_catalog() -> dict[str, dict]:
     """{product_id: fila}. Si catalog_updates aún está vacía (antes del stream), usa solo shop.catalog."""
     try:
         rows = query(CURRENT_CATALOG, timeout=30)
-    except Exception:
+    except RuntimeError as exc:
+        # Solo antes del stream puede no existir el esquema de catalog_updates.
+        if "Unknown expression identifier" not in str(exc):
+            raise
         rows = query(STATIC_CATALOG, timeout=30)
     return {r["product_id"]: r for r in rows}
 
@@ -52,7 +55,9 @@ def current_catalog() -> dict[str, dict]:
 def out_of_stock() -> set[str]:
     try:
         return {r["product_id"] for r in query(OUT_OF_STOCK)}
-    except Exception:
+    except RuntimeError as exc:
+        if "Unknown expression identifier" not in str(exc):
+            raise
         return set()
 
 

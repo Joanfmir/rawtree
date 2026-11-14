@@ -19,6 +19,8 @@ Tablas:
 from __future__ import annotations
 
 import time
+import os
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -140,7 +142,15 @@ def build(until: str | None = None, only: list[str] | None = None, verbose: bool
             continue
         t = time.time()
         df = pd.DataFrame(query(sql, timeout=900))
-        df.to_parquet(out_dir / f"{name}.parquet", index=False)
+        # Reemplazo atómico: un lector concurrente nunca abre un Parquet a medio escribir.
+        fd, tmp = tempfile.mkstemp(prefix=f".{name}-", suffix=".tmp", dir=out_dir)
+        os.close(fd)
+        try:
+            df.to_parquet(tmp, index=False)
+            os.replace(tmp, out_dir / f"{name}.parquet")
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
         tables[name] = df
         if verbose:
             print(f"  {name:16} {len(df):>9,} filas  {time.time() - t:5.1f}s")

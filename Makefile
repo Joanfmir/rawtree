@@ -1,3 +1,4 @@
+.PHONY: up down status serve ab stop dry check monitor install abtest notebook
 # Uso: make install · make check · make serve POLICY=personal NAME=Leattner.v1 · make dry POLICY=personal · make monitor
 POLICY ?= baseline
 NAME ?= $(POLICY)
@@ -10,13 +11,22 @@ install:
 check:
 	$(PY) scripts/check.py
 
-serve:   ## producción: nohup + caffeinate para que el Mac no se duerma
-	caffeinate -dimsu nohup $(PY) -u -m reco.serve --policy $(POLICY) --name $(NAME) >> logs/serve.log 2>&1 &
-	@echo "Corriendo en segundo plano. Logs: tail -f logs/serve.log"
+ARGS = $(if $(AB),--ab $(AB),--policy $(POLICY) --name $(NAME)) $(EXTRA)
 
-ab:      ## A/B en producción: make ab AB=personal_v1=Leattner.v1,personal=Leattner.v2
-	caffeinate -dimsu nohup $(PY) -u -m reco.serve --ab $(AB) >> logs/serve.log 2>&1 &
-	@echo "A/B corriendo en segundo plano. Comparar: make abtest"
+up:      ## make up AB=... o POLICY=... NAME=...; EXTRA=--dry-run para probar
+	@mkdir -p logs
+	@nohup $(PY) -u scripts/supervise.py $(ARGS) >> logs/supervisor.log 2>&1 &
+	@echo "Supervisor lanzado. Consultar: make status; logs/supervisor.log"
+
+serve: up
+
+ab: up
+
+down:
+	$(PY) scripts/supervise.py down $(EXTRA)
+
+status:
+	$(PY) scripts/supervise.py status $(EXTRA)
 
 abtest:
 	$(PY) scripts/ab.py
@@ -24,8 +34,7 @@ abtest:
 dry:
 	$(PY) -u -m reco.serve --policy $(POLICY) --dry-run
 
-stop:
-	pkill -f "reco.serve" || true
+stop: down
 
 monitor:
 	$(PY) scripts/monitor.py 30

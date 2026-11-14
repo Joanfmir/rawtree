@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 from .base import Policy
+from ..ranker import _views
 
 # v1: ajustados con scripts/tune.py search (ips_ndcg, corte 2026-11-07). Sin lógica de categoría.
 V1 = {
@@ -48,6 +49,8 @@ DEFAULT_WEIGHTS = V2
 
 def _norm_lists(df, key, item, val, top):
     """{key: [(item, val / max_val_of_key), ...]} ordenado por val desc, máximo `top` por clave."""
+    df = df.dropna(subset=[key, item, val])
+    df = df[np.isfinite(df[val].astype(float))]
     df = df.sort_values([key, val], ascending=[True, False])
     out: dict = {}
     cur, lst, vmax = object(), None, 1.0
@@ -121,7 +124,7 @@ class Personal(Policy):
         items = f["item_features"].fillna(0)
         ix.brand_of = dict(zip(items.product_id, items.brand))
         pop = np.log1p(items.purchases_7d.to_numpy(dtype=float))
-        items = items.assign(pop=pop / max(pop.max(), 1e-9))
+        items = items.assign(pop=pop / max(pop.max(initial=0), 1e-9))
         ix.top_pop = list(items.nlargest(50, "pop")[["product_id", "pop"]].itertuples(index=False, name=None))
         ix.subcat_top = _norm_lists(items, "subcategory", "product_id", "pop", 10)
         ix.cat_of = dict(zip(items.product_id, items.category))
@@ -138,7 +141,7 @@ class Personal(Policy):
         ub = ub.assign(a=ub.w / ub.groupby("user_id").w.transform("max"))
         ix.user_brand = {u: dict(v) for u, v in _group(ub.user_id.tolist(), ub.brand.tolist(), ub.a.tolist()).items()}
         up = f["user_purchases"]
-        t = (pd.to_datetime(up.last_ts) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
+        t = (pd.to_datetime(up.last_ts, utc=True, errors="coerce") - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(seconds=1)
         ix.user_bought = _group(up.user_id.tolist(), up.product_id.tolist(), up.n.clip(upper=4).tolist(), t.tolist())
 
         cp = f["context_popular"].assign(ctx=lambda d: list(zip(d.device, d.region)))
@@ -149,10 +152,10 @@ class Personal(Policy):
         w, ix = self.w, self.ix   # una sola lectura: si el refresh cambia el índice, no nos afecta
         s: dict[str, float] = defaultdict(float)
 
-        views = req.get("recent_views") or []
+        views = _views(req)
         for k, v in enumerate(reversed(views)):
             d = w["decay"] ** k
-            p = v["product_id"]
+            p = v
             s[p] += w["self"] * d
             for q, n in ix.nb_buy.get(p, ()):
                 s[q] += w["buy"] * d * n
@@ -174,13 +177,15 @@ class Personal(Policy):
         if bought:
             now = _epoch(req.get("ts"))
             for q, n, t in bought:
+                if not all(math.isfinite(float(x)) for x in (n, t)):
+                    continue
                 s[q] += w["rebuy"] * (0.5 + 0.125 * n) * math.exp(-max(now - t, 0) / 86400 / w["rebuy_days"])
 
         # Categorías de la sesión: relleno dentro de categoría y penalización (o descarte) de lo de fuera
         cats: dict[str, float] = {}
         if views and (w["cat_fill"] or w["off"] != 1):
             for k, v in enumerate(reversed(views)):
-                c = ix.cat_of.get(v["product_id"])
+                c = ix.cat_of.get(v)
                 if c is not None:
                     cats[c] = max(cats.get(c, 0.0), w["cat_decay"] ** k)
             for c, a in cats.items():
@@ -200,7 +205,7 @@ class Personal(Policy):
                         s[q] *= off
                     else:
                         del s[q]
-        return sorted(s, key=s.get, reverse=True)[:10]
+        return sorted((p for p in s if math.isfinite(s[p])), key=s.get, reverse=True)[:10]
 
 
 class PersonalV1(Personal):
@@ -212,8 +217,9 @@ class PersonalV1(Personal):
 def _epoch(ts) -> float:
     """ts de la petición ('YYYY-MM-DD HH:MM:SS.fff…', UTC) en segundos; ahora si falta."""
     try:
-        return datetime.fromisoformat(str(ts)[:19]).replace(tzinfo=timezone.utc).timestamp()
-    except ValueError:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+    except (ValueError, TypeError):
         return datetime.now(timezone.utc).timestamp()
 
 

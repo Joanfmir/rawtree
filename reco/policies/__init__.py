@@ -4,4 +4,6 @@ from .coview import Coview
 from .personal import Personal, PersonalNoRebuy, PersonalV1
 from .ranker import Ranker
 
-POLICIES = {p.name: p for p in (Baseline, Coview, Personal, PersonalV1, PersonalNoRebuy, Ranker)}
+from .explore import PersonalExplore, GuliasExplore
+
+POLICIES = {p.name: p for p in (Baseline, Coview, Personal, PersonalV1, PersonalNoRebuy, Ranker, PersonalExplore, GuliasExplore)}

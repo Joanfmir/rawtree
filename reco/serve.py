@@ -9,6 +9,12 @@ Nunca debe caerse: cualquier error en una petición se responde con el fallback.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+
+import requests
 import threading
 import time
 import zlib
@@ -25,6 +31,31 @@ SELECT request_id, user_id, is_new_user, context, recent_views, ts
 FROM shop.requests
 ORDER BY ts DESC
 LIMIT 100"""
+
+
+def acquire_lock(path: Path):
+    """Conserva abierto el descriptor: flock se libera incluso tras SIGKILL."""
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        owner = handle.read().strip() or "propietario inicializando"
+        handle.close()
+        raise SystemExit(f"Instancia ya activa en {path}: {owner}")
+    handle.seek(0)
+    handle.truncate()
+    json.dump({"pid": os.getpid(), "cwd": str(Path.cwd()), "started": time.time()}, handle)
+    handle.flush()
+    return handle
+
+
+def send_answers(answers):
+    """Solo ConnectTimeout garantiza que no se enviaron bytes; no repetir envíos ambiguos."""
+    try:
+        insert("submissions", answers, timeout=(0.5, 2.0))   # si tarda más de 2 s, ya llegaría tarde
+    except requests.exceptions.ConnectTimeout:
+        insert("submissions", answers, timeout=(0.5, 1.5))
 
 
 def _epoch(ts) -> float:
@@ -54,8 +85,16 @@ def main() -> None:
                                  "según su request_id (reparto a partes iguales). Sustituye a --policy/--name")
     ap.add_argument("--poll", type=float, default=0.3, help="segundos entre lecturas")
     args = ap.parse_args()
+    # El override permite probar sin tocar el bloqueo de producción.
+    lock = None
+    if not args.dry_run or os.environ.get("RECO_LOCK_IN_DRY_RUN") == "1":
+        path = Path.home() / ".rawtree_team17_serve.lock"
+        if args.dry_run:
+            path = Path(os.environ.get("RECO_TEST_LOCK", str(path)))
+        lock = acquire_lock(path)
     config.check()
 
+    started_at = time.time()
     state = State()
     while True:  # sin catálogo no podemos validar: reintenta hasta tenerlo
         try:
@@ -75,7 +114,7 @@ def main() -> None:
         arms.append((policy, f"{label or pol_name}{'-dry' if args.dry_run else ''}"))
     print(f"[serve] {config.TEAM} · " + " | ".join(f"{p.name}→{v}" for p, v in arms) + f" · dry_run={args.dry_run}")
 
-    seen: set[str] = set()
+    seen: dict[str, float] = {}
     refreshed_at = [0.0] * len(arms)
     stats_at, answered, errors = time.time(), 0, 0
     lags: list[float] = []
@@ -90,43 +129,47 @@ def main() -> None:
                         print(f"[policy.refresh] {policy.name}: {e}")
 
             now = time.time()
+            seen = {rid: expiry for rid, expiry in seen.items() if expiry > now}
             fresh = []
-            for r in query(NEW_REQUESTS):
+            for r in query(NEW_REQUESTS, timeout=(0.5, 1.5)):
                 if r["request_id"] in seen:
                     continue
-                seen.add(r["request_id"])
-                if now - _epoch(r.get("ts")) < 4:   # más viejas ya cayeron al fallback (límite: 3 s)
+                seen[r["request_id"]] = now + 120
+                if started_at <= _epoch(r.get("ts")) and time.time() - _epoch(r.get("ts")) < 3.5:   # más viejas ya cayeron al fallback (límite: 3 s; margen por reloj)
                     fresh.append(r)
             answers = []
             for req in fresh:
                 policy, version = arms[zlib.crc32(req["request_id"].encode()) % len(arms)]
                 try:
-                    items = policy.recommend(req, state)
+                    items = finalize(policy.recommend(req, state), state)
                 except Exception as e:
                     errors += 1
                     print(f"[recommend] {req['request_id']}: {e}")
-                    items = []
-                answers.append({"request_id": req["request_id"], "items": finalize(items, state),
+                    try:
+                        items = finalize([], state)
+                    except Exception as fallback_error:
+                        print(f"[fallback] {req['request_id']}: {fallback_error}")
+                        continue
+                answers.append({"request_id": req["request_id"], "items": items,
                                 "model_version": version})
             if answers:
                 if args.dry_run:
                     print(f"[dry-run] {answers[0]}")
                 else:
-                    insert("submissions", answers)
+                    send_answers(answers)
                 answered += len(answers)
                 now = time.time()
-                lags += [now - _epoch(r.get("ts")) for r in fresh]
+                sent_ids = {answer["request_id"] for answer in answers}
+                lags += [now - _epoch(r.get("ts")) for r in fresh if r["request_id"] in sent_ids]
 
             if time.time() - stats_at >= 60:
                 ok = sorted(lags)
                 lat = f"latencia p50 {ok[len(ok) // 2]:.2f}s p95 {ok[int(len(ok) * .95)]:.2f}s" if ok else "sin datos"
                 print(f"[stats] {answered} respuestas/min · {lat} · {errors} errores · {len(state.unavailable)} sin stock")
                 stats_at, answered, errors, lags = time.time(), 0, 0, []
-            if len(seen) > 200_000:
-                seen = set(list(seen)[-50_000:])
         except Exception as e:  # los compradores siguen llegando: no nos caemos nunca
             print(f"[error] {e}")
-            time.sleep(1)
+            time.sleep(0.1)
         time.sleep(args.poll)
 
 
