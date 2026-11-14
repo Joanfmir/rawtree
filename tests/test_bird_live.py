@@ -7,7 +7,7 @@ import pandas as pd
 
 from reco.bird import build_dataset as bd
 from reco.bird.live import LiveFeatures
-from reco.bird.schema import SESSION, V2
+from reco.bird.schema import SESSION, V2, V2_NOATTRS
 
 
 class BirdLiveTest(unittest.TestCase):
@@ -19,7 +19,7 @@ class BirdLiveTest(unittest.TestCase):
             "price_eur": [9., 19., 29.], "created_at": ["2026-09-01"] * 3,
         })
         self.items["logp"] = np.log1p(self.items.price_eur)
-        for c in V2.features:
+        for c in V2_NOATTRS.features:
             if c.startswith("it_"):
                 self.items[c] = 0.
         self.neighbors = {"buy": {1: [(2, 0.5)]}, "view": {0: [(1, 1.)]}}
@@ -34,8 +34,9 @@ class BirdLiveTest(unittest.TestCase):
         shown = np.array([[0, 1, 2, 0, 1, 2, 0, 1, 2, 0]])
         with patch.object(bd, "_neighbors", return_value=self.neighbors):
             expected = bd.session_features(sess, shown, self.items)[0, :3]
-        np.testing.assert_allclose(actual[list(SESSION)].to_numpy(), expected, equal_nan=True)
-        self.assertEqual(list(actual.columns), list(V2.features))
+        retained = [i for i, name in enumerate(SESSION) if name in V2_NOATTRS.features]
+        np.testing.assert_allclose(actual[[SESSION[i] for i in retained]].to_numpy(), expected[:, retained], equal_nan=True)
+        self.assertEqual(list(actual.columns), list(V2_NOATTRS.features))
         self.assertTrue((actual.is_new_user == 1).all())
         self.assertTrue(actual.u_logp_diff.isna().all())
 
@@ -54,6 +55,13 @@ class BirdLiveTest(unittest.TestCase):
         self.assertTrue(np.isnan(x.days_since_last_purchase.iloc[2]))
         np.testing.assert_allclose(x.u_days_since_last, 1)
         np.testing.assert_allclose(x.u_logp_diff, self.items.logp - self.items.logp[:2].mean())
+
+    def test_no_attribute_features_in_training_or_live_schema(self):
+        excluded = {"attr1", "attr2", "sv_attr_share", "u_attr_share"}
+        self.assertEqual(len(V2_NOATTRS.features), 57)
+        self.assertEqual(set(V2.features) - set(V2_NOATTRS.features), excluded)
+        self.assertFalse(excluded & set(V2_NOATTRS.categorical))
+        self.assertFalse(excluded & set(LiveFeatures(self.snapshot).build(self.req).columns))
 
     def test_rejects_requests_older_than_snapshot(self):
         self.req["ts"] = "2026-11-14 09:59:59"

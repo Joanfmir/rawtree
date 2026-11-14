@@ -1,7 +1,7 @@
 """Bird (CatBoost): datos sintéticos, entrenamiento, evaluación y latencia.
 
     python scripts/bird.py dataset                        # dataset REAL v2 desde RawTree (data/bird/v2/)
-    python scripts/bird.py train --schema v2              # entrena con él (v2_norebuy: sin features de recompra)
+    python scripts/bird.py train --schema v2_noattrs      # 57 features, sin atributos ni afinidad por atributos
     python scripts/bird.py eval --schema v2 --data data/bird/v2/test_v2.parquet
     python scripts/bird.py synth --requests 20000         # dataset de prueba con el esquema del contrato (v1)
     python scripts/bird.py train --train data/bird/synth/train_v1.parquet --valid data/bird/synth/validation_v1.parquet

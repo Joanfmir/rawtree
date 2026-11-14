@@ -88,5 +88,13 @@ def _v2(version: str, rebuy: bool) -> FeatureSchema:
 
 V2 = _v2("v2", rebuy=True)
 V2_NOREBUY = _v2("v2_norebuy", rebuy=False)
+_ATTR_FEATURES = {"attr1", "attr2", "sv_attr_share", "u_attr_share"}
+V2_NOATTRS = FeatureSchema(
+    version="v2_noattrs",
+    features=tuple(f for f in V2.features if f not in _ATTR_FEATURES),
+    categorical=tuple(f for f in V2.categorical if f not in _ATTR_FEATURES),
+    per_request=tuple(f for f in V2.per_request if f not in _ATTR_FEATURES),
+    metadata=V2.metadata,
+)
 
-SCHEMAS = {s.version: s for s in (V1, V2, V2_NOREBUY)}
+SCHEMAS = {s.version: s for s in (V1, V2, V2_NOREBUY, V2_NOATTRS)}

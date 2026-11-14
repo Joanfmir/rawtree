@@ -20,7 +20,7 @@ class BirdV2(Policy):
     def fit(self, state):
         if self.until:
             raise ValueError("bird_v2 live snapshots cannot be used for historical evaluation")
-        self.model = BirdModel.load(model_dir("v2"))
+        self.model = BirdModel.load(model_dir("v2_noattrs"))
         self.fs = LiveFeatures(pickle.loads(SNAPSHOT.read_bytes()))
         self._building = False
         self._loaded_at = time.time()

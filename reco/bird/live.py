@@ -18,7 +18,7 @@ from .. import config, features
 from ..catalog import CURRENT_CATALOG
 from ..client import query
 from . import build_dataset as bd
-from .schema import SESSION, V2
+from .schema import SESSION, V2_NOATTRS
 
 SNAPSHOT = config.DATA_DIR / "bird" / "live.pkl"
 
@@ -125,7 +125,7 @@ class LiveFeatures:
         context = req.get("context") or {}
         for key in ("page", "device", "region"):
             df[key] = context.get(key) or "UNKNOWN"
-        for col in V2.per_request:
+        for col in V2_NOATTRS.per_request:
             if col not in df:
                 df[col] = 0.0
         now = pd.Timestamp(req.get("ts") or pd.Timestamp.now(tz="UTC"))
@@ -135,7 +135,7 @@ class LiveFeatures:
             raise ValueError("request predates feature snapshot")
         ts = now.timestamp()
         df["it_age_days"] = (now - pd.to_datetime(df.created_at)).dt.total_seconds() / 86400
-        df["position"] = V2.reference_position
+        df["position"] = V2_NOATTRS.reference_position
         views = [self.pid[v["product_id"]] for v in req.get("recent_views", [])
                  if isinstance(v, dict) and v.get("product_id") in self.pid]
         df["n_recent_views"] = len(views)
@@ -150,12 +150,6 @@ class LiveFeatures:
                 a = df[col].to_numpy()
                 df[f"sv_same_{label}_last"] = (a == a[rev[0]]).astype(float)
                 df[f"sv_{label}_share"] = (a[:, None] == a[views][None, :]).mean(axis=1)
-            # Match the existing training builder's separate encodings exactly.
-            a = df.attr1.astype("category").cat.codes.to_numpy()
-            b = df.attr2.astype("category").cat.codes.to_numpy()
-            same = ((a[:, None] == a[views]) | (a[:, None] == b[views])).astype(float)
-            same += ((b[:, None] == a[views]) | (b[:, None] == b[views])).astype(float)
-            df["sv_attr_share"] = same.mean(axis=1) / 2
             df["sv_logp_diff"] = df.logp - df.logp.iloc[views].mean()
             for kind, col in (("buy", "view_to_purchase_score"), ("view", "coview_score")):
                 score = np.zeros(n)
@@ -188,11 +182,6 @@ class LiveFeatures:
                     df[f"u_{label}_buys"] = aggregate(buys)
                 if label == "sub":
                     df["u_sub_w_7d"] = aggregate(w7)
-            attr_w = {}
-            for col in ("attr1", "attr2"):
-                for a, weight in zip(df[col].iloc[ix], w):
-                    attr_w[a] = attr_w.get(a, 0) + weight
-            df["u_attr_share"] = (df.attr1.map(attr_w).fillna(0) + df.attr2.map(attr_w).fillna(0)) / (2 * w.sum())
             for j, col in enumerate(("up_views", "up_carts", "up_buys", "up_c_clicks", "up_c_buys"), 1):
                 df.loc[ix, col] = h[:, j]
             df.loc[ix, "up_days_since_seen"] = (ts - h[:, 9]) / 86400
@@ -200,7 +189,7 @@ class LiveFeatures:
             df.loc[ix, "days_since_last_purchase"] = db
         df["previous_purchase_count"] = df.up_buys + df.up_c_buys
         df["already_purchased"] = (df.previous_purchase_count > 0).astype(float)
-        return df[list(V2.features)]
+        return df[list(V2_NOATTRS.features)]
 
 
 if __name__ == "__main__":
