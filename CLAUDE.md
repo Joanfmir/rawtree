@@ -35,7 +35,7 @@ y se añade a esta tabla y a `BIRD_VERSIONS` en `reco/policies/__init__.py`.
 |---|---|---|
 | v1-bird | `bird_v1` | CatBoost con las 5 features del contrato inicial (sin personalización) |
 | v2-bird | `bird_v2` | CatBoost con 56 features (dataset v2), sin recompra; puntúa todo el catálogo |
-| v3-bird | `bird_blend_rank` | `personal_v5` propone 50 candidatos y el modelo de ranking (YetiRank) los ordena |
+| v3-bird | `bird_blend_rank` | `personal_v6` (`personal_v5` sin recompra: no propone nada ya comprado por el usuario) propone 50 candidatos y el modelo de ranking (YetiRank) los ordena |
 
 El nombre de versión funciona como política: `make dry POLICY=v3-bird`, `make up AB=<otros brazos>,v3-bird=v3-bird`.
 Código en `reco/bird/` y `reco/policies/bird.py`; entrenamiento y evaluación con `scripts/bird.py` y

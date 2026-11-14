@@ -190,7 +190,7 @@ class BirdRank(BirdV2):
 
 
 class BirdBlend(Policy):
-    """Mezcla: personal_v5 propone sus N mejores candidatos y Bird decide el orden.
+    """Mezcla: personal_v6 (personal_v5 sin recompra) propone sus N mejores candidatos y Bird decide el orden.
 
     Cada uno cubre el punto débil del otro: personal acierta QUÉ productos merecen estar (también con
     usuarios nuevos) y Bird los ORDENA mejor. Offline (corte 07/11): ips_ndcg 0,25 frente a 0,21 de Bird
@@ -198,12 +198,13 @@ class BirdBlend(Policy):
     """
     name = "bird_blend"
     bird_class = BirdV2
+    personal_class = None   # por defecto PersonalV6: no gasta candidatos en lo que el usuario ya compró
     n = 50
     refresh_every = 120.0
 
     def fit(self, state):
-        from .personal import PersonalV5
-        self.personal = PersonalV5(until=self.until, weights={"top": self.n})
+        from .personal import PersonalV6
+        self.personal = (self.personal_class or PersonalV6)(until=self.until, weights={"top": self.n})
         self.personal.fit(state)
         self.bird = self.bird_class(until=self.until)
         self.bird.fit(state)

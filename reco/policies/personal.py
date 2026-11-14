@@ -78,7 +78,17 @@ V4 = {**V3, "organic": 0.0, "fb": 0.7, "cat_recency": 0.0, "sub_fill": 0.0}
 #                Se refresca cada 2 min desde team.feedback, sin esperar al rebuild de features (10 min).
 #   top          devuelve 30 candidatos: finalize() rellena con los nuestros antes que con best sellers.
 V5 = {**V4, "hist_off": 0.5, "live_rebuy": 0.0, "top": 30}
-VERSIONS = {"v1": V1, "v2": V2, "v3": V3, "v4": V4, "v5": V5}
+# v6: v5 + penalización de la recompra. El simulador penaliza volver a ofrecer algo ya comprado (README: "a
+# shopper who already bought a product tends not to want it again"; en vivo convierte ~9× menos, ver bird_v2).
+#   bought       multiplicador de TODO lo que el usuario ya compró (user_purchases: orgánico + carrusel).
+#                0 = no se propone; 1 = sin efecto (v1-v5). v5 solo quitaba lo comprado únicamente de forma
+#                orgánica (organic = 0) y lo vendido en vivo (live_rebuy = 0), y además subía a lo más alto lo
+#                comprado antes en carrusel (hist_carousel = 4). Con bought = 0 ese bonus deja de tener efecto;
+#                carrito abandonado y clic antiguo (nunca comprados) siguen contando.
+#                En la mezcla con Bird (v3-bird), Bird ya descartaba esos productos: ocupaban plazas de los 50
+#                candidatos sin poder salir. Ahora las plazas son para productos recomendables.
+V6 = {**V5, "bought": 0.0}
+VERSIONS = {"v1": V1, "v2": V2, "v3": V3, "v4": V4, "v5": V5, "v6": V6}
 DEFAULT_WEIGHTS = V2
 
 
@@ -308,6 +318,15 @@ class Personal(Policy):
             sold = Personal._live_bought
             for q in [q for q in s if (uid, q) in sold]:
                 del s[q]
+        # v6: penalización de la recompra sobre todo lo que el usuario ya compró (histórico, cualquier origen).
+        rb = w.get("bought", 1.0)
+        if rb != 1.0:
+            for q, *_ in bought:
+                if q in s:
+                    if rb:
+                        s[q] *= rb
+                    else:
+                        del s[q]
         # top > 10 (v5): finalize() se queda con los 10 primeros válidos; con margen, un agotado lo sustituye
         # nuestro siguiente candidato y no un best seller del relleno (que puede ser algo ya vendido).
         return sorted((p for p in s if math.isfinite(s[p])), key=s.get, reverse=True)[:int(w.get("top", 10))]
@@ -361,6 +380,12 @@ class PersonalV5(Personal):
             Personal._live_bought = frozenset((r["u"], r["p"]) for r in rows)
         except Exception as e:
             print(f"[personal_v5] ventas en vivo no actualizadas, sigo con las anteriores: {e}")
+
+
+class PersonalV6(PersonalV5):
+    """v5 + penalización de la recompra: no propone nada que el usuario ya haya comprado (ver V6)."""
+    name = "personal_v6"
+    version = "v6"
 
 
 class PersonalV1(Personal):
