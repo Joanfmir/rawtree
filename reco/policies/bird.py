@@ -228,3 +228,18 @@ class BirdBlendRank(BirdBlend):
     """La misma mezcla con el modelo de ranking: empata en ips_ndcg y va algo mejor con usuarios nuevos."""
     name = "bird_blend_rank"
     bird_class = BirdRank
+
+
+class BirdV2Hoy(BirdV2):
+    """v2-hoy: el clasificador de v2-bird (mismas 56 features, mismo código de servir) entrenado desde cero
+    SOLO con nuestro feedback en vivo del 14/11 (scripts/bird_live.py --save → data/bird/v2_hoy).
+    En el test en vivo queda por debajo de v2_live (NDCG 0,605 frente a 0,666): probar como brazo de A/B."""
+    name = "bird_v2_hoy"
+    model_name = final_name = "v2_hoy"   # siempre este modelo, también en la evaluación offline
+
+
+class BirdBlendHoy(BirdBlend):
+    """v2-hoy-blend: personal_v5 propone 50 candidatos y v2_hoy los ordena (como v3-bird, con este modelo)."""
+    name = "bird_blend_hoy"
+    bird_class = BirdV2Hoy
+
