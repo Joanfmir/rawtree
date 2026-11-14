@@ -74,7 +74,7 @@ def _metrics(recs: list[list[str]], df: pd.DataFrame) -> dict[str, float]:
         hit = pos >= 0
         out[f"{prefix}n"] = int(mask.sum())
         out[f"{prefix}hit@10"] = hit.mean()
-        out[f"{prefix}ndcg@10"] = np.where(hit, 1 / np.log2(pos + 2), 0).mean()
+        out[f"{prefix}ndcg@10"] = np.where(hit, 1 / np.log2(np.maximum(pos, 0) + 2), 0).mean()
         if not prefix:
             # propensity del producto comprado en el slot en el que lo enseñó el sistema viejo
             props = np.array([p[s.index(t)] for p, s, t in
@@ -86,20 +86,28 @@ def _metrics(recs: list[list[str]], df: pd.DataFrame) -> dict[str, float]:
 
 def evaluate(policy, df: pd.DataFrame, state: State, known_users: set[str]) -> pd.DataFrame:
     """Métricas globales y por segmento para una política ya entrenada (fit)."""
+    def run(hide_user: bool) -> list[list[str]]:
+        recs = []
+        for row in df.itertuples(index=False):
+            req = {"request_id": row.request_id, "user_id": None if hide_user else row.user_id,
+                   "is_new_user": hide_user or row.user_id not in known_users,
+                   "context": row.context, "recent_views": row.recent_views, "ts": row.ts}
+            recs.append(finalize(policy.recommend(req, state), state))
+        return recs
+
     t = time.time()
-    recs = []
-    for row in df.itertuples(index=False):
-        req = {"request_id": row.request_id, "user_id": row.user_id, "is_new_user": row.user_id not in known_users,
-               "context": row.context, "recent_views": row.recent_views}
-        recs.append(finalize(policy.recommend(req, state), state))
+    recs = run(hide_user=False)
     ms = (time.time() - t) / len(df) * 1000
+    # cold start: mismas peticiones sin saber quién es el usuario (en el test no hay usuarios nuevos)
+    recs_anon = run(hide_user=True)
     known = df.user_id.isin(known_users).to_numpy()
     has_views = (df.recent_views.str.len() > 0).to_numpy()
-    segments = {"todos": np.ones(len(df), bool), "conocidos": known, "nuevos": ~known,
+    segments = {"todos": np.ones(len(df), bool), "conocidos": known,
                 "con vistas": has_views, "sin vistas": ~has_views}
     rows = {}
     for name, m in segments.items():
         rows[name] = _metrics([r for r, k in zip(recs, m) if k], df[m])
+    rows["simulados nuevos"] = _metrics(recs_anon, df)
     out = pd.DataFrame(rows).T
     out["ms/req"] = ms
     return out
