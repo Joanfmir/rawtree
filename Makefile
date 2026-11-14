@@ -1,5 +1,5 @@
-.PHONY: up down status serve ab stop dry check monitor install abtest notebook
-# Uso: make install · make check · make serve POLICY=personal NAME=Leattner.v1 · make dry POLICY=personal · make monitor
+.PHONY: up down status serve ab stop dry check monitor install abtest notebook offline
+# Uso: make install · make check · make offline C="politica" · make serve POLICY=personal NAME=Leattner.v1 · make dry POLICY=personal · make monitor
 POLICY ?= baseline
 NAME ?= $(POLICY)
 # En un worktree sin .venv propio se usa el del clon principal
@@ -35,6 +35,9 @@ dry:
 	$(PY) -u -m reco.serve --policy $(POLICY) --dry-run
 
 stop: down
+
+offline:   ## evaluación offline contrastada con el leaderboard; C="pol1 pol2" para candidatos
+	$(PY) scripts/offline_vs_live.py $(if $(C),--candidates $(C)) $(EXTRA)
 
 monitor:
 	$(PY) scripts/monitor.py 30
