@@ -353,6 +353,12 @@ def policy_key(name: str, until: str) -> str:
         h.update(str(f.relative_to(ROOT)).encode())
         h.update(f.read_bytes())
     h.update("|".join(_data_fingerprint(until)).encode())
+    # modelos de otras carpetas de data/ (p. ej. data/joan/): cuentan si el código de la política las nombra
+    code = "".join(f.read_text(encoding="utf-8") for f in files)
+    for d in sorted(p for p in DATA_DIR.iterdir() if p.is_dir() and p.name != "bird"):
+        if f'"{d.name}"' in code:
+            h.update("|".join(f"{m.relative_to(DATA_DIR)}:{m.stat().st_size}:{int(m.stat().st_mtime)}"
+                              for m in sorted(d.glob("*/*")) if m.suffix in (".cbm", ".json", ".txt")).encode())
     return h.hexdigest()[:12]
 
 

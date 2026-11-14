@@ -120,10 +120,34 @@ def queries(until: str | None) -> dict[str, str]:
 
 
 def download(until: str | None = None, verbose: bool = True) -> Path:
-    """Descarga las tablas y las deja en Parquet. Escribe en una carpeta temporal y la cambia al final."""
+    """Descarga las tablas y las deja en Parquet. Escribe en una carpeta temporal y la cambia al final.
+
+    Seguro con varios procesos a la vez (dos brazos de un A/B, o un dry run junto a producción): cada uno
+    escribe en su propia carpeta temporal, un cerrojo hace que solo uno descargue a la vez, y cada fichero se
+    vuelve a leer antes de sustituir al anterior. Antes, dos descargas simultáneas en la misma carpeta .tmp
+    dejaban Parquets truncados en state_live (el 14/11 a las 21:30)."""
+    import fcntl
+    import tempfile
     out = folder(until)
-    tmp = out.with_name(out.name + ".tmp")
-    tmp.mkdir(parents=True, exist_ok=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out.with_name(out.name + ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        tmp = Path(tempfile.mkdtemp(prefix=out.name + ".tmp-", dir=out.parent))
+        try:
+            _download_into(tmp, until, verbose)
+            for f in tmp.glob("*.parquet"):
+                pd.read_parquet(f)          # si está corrupto, falla aquí y no se toca el estado bueno
+            out.mkdir(parents=True, exist_ok=True)
+            for f in tmp.glob("*.parquet"):
+                f.replace(out / f.name)
+        finally:
+            for f in tmp.glob("*"):
+                f.unlink()
+            tmp.rmdir()
+    return out
+
+
+def _download_into(tmp: Path, until: str | None, verbose: bool) -> None:
     for name, sql in queries(until).items():
         t = time.time()
         if name in CHUNKED:   # RawTree devuelve como mucho 100 MiB por consulta: se parte por hash de usuario
@@ -135,11 +159,6 @@ def download(until: str | None = None, verbose: bool = True) -> Path:
         df.to_parquet(tmp / f"{name}.parquet", index=False)
         if verbose:
             print(f"  {name:<13} {len(df):>9,} filas  {time.time() - t:.1f}s")
-    out.mkdir(parents=True, exist_ok=True)
-    for f in tmp.glob("*.parquet"):
-        f.replace(out / f.name)
-    tmp.rmdir()
-    return out
 
 
 # ── estado en memoria ────────────────────────────────────────────────────────────────────────────────
