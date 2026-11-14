@@ -5,4 +5,5 @@ scikit-learn
 jupyter
 pyarrow
 lightgbm
+catboost
 matplotlib
