@@ -16,27 +16,44 @@ Las vistas recientes pesan más cuanto más recientes: × decay^k (k = 0 la últ
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 
 from .base import Policy
 
+# Ajustados con scripts/tune.py search (búsqueda coordenada sobre ips_ndcg, corte 2026-11-07)
 DEFAULT_WEIGHTS = {
-    "self": 1.0, "buy": 1.0, "view": 0.3, "user": 0.5, "ctx": 0.3, "pop": 0.2,
-    "brand": 0.5, "rebuy": 2.0, "rebuy_days": 30.0, "decay": 0.6,
+    "self": 0.15, "buy": 1.0, "view": 0.1, "user": 1.0, "ctx": 0.15, "pop": 0.4,
+    "brand": 0.5, "rebuy": 1.0, "rebuy_days": 30.0, "decay": 0.6,
 }
 
 
 def _norm_lists(df, key, item, val, top):
-    """{key: [(item, val / max_val_of_key), ...]} ordenado por val, máximo `top` por clave."""
-    out = {}
+    """{key: [(item, val / max_val_of_key), ...]} ordenado por val desc, máximo `top` por clave."""
     df = df.sort_values([key, val], ascending=[True, False])
-    for k, g in df.groupby(key, sort=False):
-        v = g[val].to_numpy(dtype=float)[:top]
-        out[k] = list(zip(g[item].to_numpy()[:top], v / max(v[0], 1e-9)))
+    out: dict = {}
+    cur, lst, vmax = object(), None, 1.0
+    for k, i, v in zip(df[key].tolist(), df[item].tolist(), df[val].tolist()):
+        if k != cur:
+            cur, lst, vmax = k, [], max(float(v), 1e-9)
+            out[k] = lst
+        if len(lst) < top:
+            lst.append((i, v / vmax))
+    return out
+
+
+def _group(keys, *cols):
+    """{key: [(col1, col2, ...), ...]} conservando el orden de las filas."""
+    out: dict = {}
+    for k, *vals in zip(keys, *cols):
+        out.setdefault(k, []).append(tuple(vals))
     return out
 
 
@@ -47,35 +64,68 @@ class Personal(Policy):
         super().__init__(until)
         self.w = {**DEFAULT_WEIGHTS, **(weights or {})}
 
+    refresh_every = 600.0   # en vivo: recalcula las features cada 10 min en segundo plano
+
     def fit(self, state):
-        f = self.load_features()
+        """Carga las features del disco (si no hay, las construye). En producción, el primer refresh()
+        del bucle las recalcula en segundo plano, así que arrancar con unas antiguas es seguro y rápido."""
+        self.ix = self._index(self.load_features())
+        self._building = False
+
+    def refresh(self, state):
+        """En vivo: reconstruye las features en un hilo y cambia el índice de golpe al terminar."""
+        if self.until is not None or self._building:
+            return
+        self._building = True
+
+        def work():
+            # La descarga y el JSON (600k filas) bloquean el GIL varios segundos: en un proceso aparte
+            # no frenan el bucle de respuestas. Aquí solo leemos el Parquet y montamos el índice (~1,5 s).
+            from .. import features
+            from ..config import ROOT
+            try:
+                subprocess.run([sys.executable, str(ROOT / "scripts" / "build_features.py")], cwd=ROOT,
+                               check=True, capture_output=True, timeout=600)
+                self.ix = self._index(features.load(until=None))
+                print(f"[personal] features actualizadas: {len(self.ix.user_bought)} usuarios con compras")
+            except Exception as e:
+                print(f"[personal] refresh falló, sigo con las anteriores: {e}")
+            finally:
+                self._building = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _index(f) -> SimpleNamespace:
+        """De las tablas de features a diccionarios rápidos de consultar."""
+        ix = SimpleNamespace()
         items = f["item_features"].fillna(0)
-        self.brand_of = dict(zip(items.product_id, items.brand))
+        ix.brand_of = dict(zip(items.product_id, items.brand))
         pop = np.log1p(items.purchases_7d.to_numpy(dtype=float))
         items = items.assign(pop=pop / max(pop.max(), 1e-9))
-        self.top_pop = list(items.nlargest(50, "pop")[["product_id", "pop"]].itertuples(index=False, name=None))
-        self.subcat_top = _norm_lists(items, "subcategory", "product_id", "pop", 10)
+        ix.top_pop = list(items.nlargest(50, "pop")[["product_id", "pop"]].itertuples(index=False, name=None))
+        ix.subcat_top = _norm_lists(items, "subcategory", "product_id", "pop", 10)
 
         nb = f["item_neighbors"]
-        self.nb_buy = _norm_lists(nb[nb.kind == "buy"], "p", "q", "n", 20)
-        self.nb_view = _norm_lists(nb[nb.kind == "view"], "p", "q", "n", 20)
+        ix.nb_buy = _norm_lists(nb[nb.kind == "buy"], "p", "q", "n", 20)
+        ix.nb_view = _norm_lists(nb[nb.kind == "view"], "p", "q", "n", 20)
 
-        us = f["user_subcat"]
+        us = f["user_subcat"].sort_values(["user_id", "w"], ascending=[True, False])
         us = us.assign(a=us.w / us.groupby("user_id").w.transform("sum"))
-        self.user_subcat = {u: list(zip(g.subcategory, g.a))[:5] for u, g in us.groupby("user_id", sort=False)}
+        ix.user_subcat = {u: v[:5] for u, v in _group(us.user_id.tolist(), us.subcategory.tolist(), us.a.tolist()).items()}
         ub = f["user_brand"]
         ub = ub.assign(a=ub.w / ub.groupby("user_id").w.transform("max"))
-        self.user_brand = {u: dict(zip(g.brand, g.a)) for u, g in ub.groupby("user_id", sort=False)}
+        ix.user_brand = {u: dict(v) for u, v in _group(ub.user_id.tolist(), ub.brand.tolist(), ub.a.tolist()).items()}
         up = f["user_purchases"]
         t = (pd.to_datetime(up.last_ts) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
-        self.user_bought = {u: list(zip(g.product_id, g.n.clip(upper=4), t[g.index]))
-                            for u, g in up.groupby("user_id", sort=False)}
+        ix.user_bought = _group(up.user_id.tolist(), up.product_id.tolist(), up.n.clip(upper=4).tolist(), t.tolist())
 
         cp = f["context_popular"].assign(ctx=lambda d: list(zip(d.device, d.region)))
-        self.ctx_pop = _norm_lists(cp, "ctx", "product_id", "n", 30)
+        ix.ctx_pop = _norm_lists(cp, "ctx", "product_id", "n", 30)
+        return ix
 
     def recommend(self, req, state):
-        w = self.w
+        w, ix = self.w, self.ix   # una sola lectura: si el hilo de refresh cambia el índice, no nos afecta
         s: dict[str, float] = defaultdict(float)
 
         views = req.get("recent_views") or []
@@ -83,32 +133,32 @@ class Personal(Policy):
             d = w["decay"] ** k
             p = v["product_id"]
             s[p] += w["self"] * d
-            for q, n in self.nb_buy.get(p, ()):
+            for q, n in ix.nb_buy.get(p, ()):
                 s[q] += w["buy"] * d * n
-            for q, n in self.nb_view.get(p, ()):
+            for q, n in ix.nb_view.get(p, ()):
                 s[q] += w["view"] * d * n
 
         user = None if req.get("is_new_user") else req.get("user_id")
-        for sub, a in self.user_subcat.get(user, ()):
-            for q, n in self.subcat_top.get(sub, ()):
+        for sub, a in ix.user_subcat.get(user, ()):
+            for q, n in ix.subcat_top.get(sub, ()):
                 s[q] += w["user"] * a * n
 
         ctx = req.get("context") or {}
-        for q, n in self.ctx_pop.get((ctx.get("device"), ctx.get("region")), ()):
+        for q, n in ix.ctx_pop.get((ctx.get("device"), ctx.get("region")), ()):
             s[q] += w["ctx"] * n
-        for q, n in self.top_pop:
+        for q, n in ix.top_pop:
             s[q] += w["pop"] * n
 
-        bought = self.user_bought.get(user, ())
+        bought = ix.user_bought.get(user, ())
         if bought:
             now = _epoch(req.get("ts"))
             for q, n, t in bought:
                 s[q] += w["rebuy"] * (0.5 + 0.125 * n) * math.exp(-max(now - t, 0) / 86400 / w["rebuy_days"])
 
-        brands = self.user_brand.get(user)
+        brands = ix.user_brand.get(user)
         if brands:
             for q in s:
-                s[q] *= 1 + w["brand"] * brands.get(self.brand_of.get(q), 0)
+                s[q] *= 1 + w["brand"] * brands.get(ix.brand_of.get(q), 0)
         return sorted(s, key=s.get, reverse=True)[:10]
 
 

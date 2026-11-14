@@ -89,10 +89,11 @@ def _metrics(recs: list[list[str]], df: pd.DataFrame) -> dict[str, float]:
                               zip(df.propensity.to_numpy()[mask], df.shown.to_numpy()[mask], tgt)])
             w = 1 / np.clip(props, 1e-3, None)
             out["ips_hit"] = (w * hit).sum() / w.sum()
+            out["ips_ndcg"] = (w * np.where(hit, 1 / np.log2(np.maximum(pos, 0) + 2), 0)).sum() / w.sum()
     return out
 
 
-def evaluate(policy, df: pd.DataFrame, state: State, known_users: set[str]) -> pd.DataFrame:
+def evaluate(policy, df: pd.DataFrame, state: State, known_users: set[str], anon: bool = True) -> pd.DataFrame:
     """Métricas globales y por segmento para una política ya entrenada (fit)."""
     def run(hide_user: bool) -> list[list[str]]:
         recs = []
@@ -107,7 +108,7 @@ def evaluate(policy, df: pd.DataFrame, state: State, known_users: set[str]) -> p
     recs = run(hide_user=False)
     ms = (time.time() - t) / len(df) * 1000
     # cold start: mismas peticiones sin saber quién es el usuario (en el test no hay usuarios nuevos)
-    recs_anon = run(hide_user=True)
+    recs_anon = run(hide_user=True) if anon else None
     known = df.user_id.isin(known_users).to_numpy()
     has_views = (df.recent_views.str.len() > 0).to_numpy()
     segments = {"todos": np.ones(len(df), bool), "conocidos": known,
@@ -115,7 +116,8 @@ def evaluate(policy, df: pd.DataFrame, state: State, known_users: set[str]) -> p
     rows = {}
     for name, m in segments.items():
         rows[name] = _metrics([r for r, k in zip(recs, m) if k], df[m])
-    rows["simulados nuevos"] = _metrics(recs_anon, df)
+    if anon:
+        rows["simulados nuevos"] = _metrics(recs_anon, df)
     out = pd.DataFrame(rows).T
     out["ms/req"] = ms
     return out
@@ -146,10 +148,10 @@ def main() -> None:
         res = evaluate(policy, df, state, known)
         summary[name] = res.loc["todos"]
         print(f"── {name}")
-        print(res[["n", "hit@10", "ndcg@10", "ips_hit", "click_hit@10", "ms/req"]]
+        print(res[["n", "hit@10", "ndcg@10", "ips_hit", "ips_ndcg", "click_hit@10", "ms/req"]]
               .to_string(float_format=lambda x: f"{x:.4f}"), "\n")
     print("── Resumen (todos)")
-    print(pd.DataFrame(summary).T[["hit@10", "ndcg@10", "ips_hit", "click_hit@10"]]
+    print(pd.DataFrame(summary).T[["hit@10", "ndcg@10", "ips_hit", "ips_ndcg", "click_hit@10"]]
           .to_string(float_format=lambda x: f"{x:.4f}"))
 
 
