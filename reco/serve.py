@@ -9,15 +9,25 @@ from __future__ import annotations
 
 import argparse
 import time
+from datetime import datetime, timezone
 
-from . import config
+from . import config, storage
 from .client import insert, query
 from .policies import POLICIES
 from .safety import finalize
 from .state import State
 
+def _lag_ms(ts: str, now: datetime) -> float | None:
+    """ms desde el ts de la petición (UTC, 'YYYY-MM-DD HH:MM:SS.fffffffff') hasta now."""
+    try:
+        t = datetime.fromisoformat(str(ts)[:23]).replace(tzinfo=timezone.utc)
+        return round((now - t).total_seconds() * 1000, 1)
+    except ValueError:
+        return None
+
+
 NEW_REQUESTS = """
-SELECT request_id, is_new_user, context, recent_views, ts
+SELECT request_id, user_id, is_new_user, context, recent_views, ts
 FROM shop.requests
 ORDER BY ts DESC
 LIMIT 100"""
@@ -43,6 +53,7 @@ def main() -> None:
     policy = POLICIES[args.policy]()
     policy.fit(state)
     version = f"{policy.name}{'-dry' if args.dry_run else ''}"
+    storage.start(remote=not args.dry_run)
     print(f"[serve] {config.TEAM} · política={policy.name} · dry_run={args.dry_run}")
 
     seen: set[str] = set()
@@ -78,6 +89,15 @@ def main() -> None:
                 else:
                     insert("submissions", answers)
                 answered += len(answers)
+                sent = datetime.now(timezone.utc)
+                storage.save([{
+                    "kind": "decision",
+                    "request_id": req["request_id"], "request_ts": str(req.get("ts")),
+                    "user_id": req.get("user_id"), "is_new_user": req.get("is_new_user"),
+                    "context": req.get("context"), "recent_views": req.get("recent_views") or [],
+                    "items": ans["items"], "model_version": version, "dry_run": args.dry_run,
+                    "sent_at": sent.isoformat(timespec="milliseconds"), "lag_ms": _lag_ms(req.get("ts"), sent),
+                } for req, ans in zip(fresh, answers)])
 
             if time.time() - stats_at >= 60:
                 print(f"[stats] {answered} respuestas/min · {errors} errores · {len(state.unavailable)} sin stock")
