@@ -116,7 +116,9 @@ def cmd_eval(args) -> None:
     p = bird.predict(df)
     print(metrics.show(metrics.report(df, p, bird.schema)))
     print("── calibración por deciles de probabilidad predicha")
-    print(metrics.calibration_table(df[bird.schema.target].to_numpy(), p).to_string(float_format=lambda x: f"{x:.5f}"))
+    w = df["sample_weight"].to_numpy() if "sample_weight" in df.columns else None
+    print(metrics.calibration_table(df[bird.schema.target].to_numpy(), p, w=w)
+          .to_string(float_format=lambda x: f"{x:.5f}"))
     print("\nEl ranking de arriba es SOLO entre los 10 productos enseñados; sobre el catálogo completo:\n"
           "  python -m reco.evaluate --policies bird_v1 personal")
 
