@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd  # noqa: E402
 
 from reco import evaluate as ev, features  # noqa: E402
-from reco.policies.personal import DEFAULT_WEIGHTS, Personal  # noqa: E402
+from reco.policies.personal import DEFAULT_WEIGHTS, Personal, V1  # noqa: E402
 
 UNTIL = sys.argv[2] if len(sys.argv) > 2 else ev.DEFAULT_UNTIL
 feats = features.load(until=UNTIL)

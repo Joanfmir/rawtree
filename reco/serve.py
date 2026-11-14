@@ -2,6 +2,7 @@
 
     python -m reco.serve --policy coview            # en producción
     python -m reco.serve --policy coview --dry-run  # prueba: calcula pero NO envía
+    python -m reco.serve --ab personal_v1=Leattner.v1,personal=Leattner.v2   # A/B en vivo
 
 Nunca debe caerse: cualquier error en una petición se responde con el fallback.
 """
@@ -10,6 +11,7 @@ from __future__ import annotations
 import argparse
 import threading
 import time
+import zlib
 from datetime import datetime, timezone
 
 from . import config
@@ -48,6 +50,8 @@ def main() -> None:
     ap.add_argument("--policy", default="baseline", choices=sorted(POLICIES))
     ap.add_argument("--dry-run", action="store_true", help="no inserta en submissions")
     ap.add_argument("--name", help="model_version que verá el leaderboard (por defecto, el nombre de la política)")
+    ap.add_argument("--ab", help="A/B en vivo: 'politica=Nombre,politica=Nombre'. Cada petición va a un brazo fijo "
+                                 "según su request_id (reparto a partes iguales). Sustituye a --policy/--name")
     ap.add_argument("--poll", type=float, default=0.3, help="segundos entre lecturas")
     args = ap.parse_args()
     config.check()
@@ -62,22 +66,27 @@ def main() -> None:
             time.sleep(5)
 
     threading.Thread(target=_keep_state_fresh, args=(state,), daemon=True).start()
-    policy = POLICIES[args.policy]()
-    policy.fit(state)
-    version = f"{args.name or policy.name}{'-dry' if args.dry_run else ''}"
-    print(f"[serve] {config.TEAM} · política={policy.name} · versión={version} · dry_run={args.dry_run}")
+    spec = args.ab or f"{args.policy}={args.name or args.policy}"
+    arms = []   # [(política, model_version)]
+    for part in spec.split(","):
+        pol_name, _, label = part.strip().partition("=")
+        policy = POLICIES[pol_name]()
+        policy.fit(state)
+        arms.append((policy, f"{label or pol_name}{'-dry' if args.dry_run else ''}"))
+    print(f"[serve] {config.TEAM} · " + " | ".join(f"{p.name}→{v}" for p, v in arms) + f" · dry_run={args.dry_run}")
 
     seen: set[str] = set()
     refreshed_at, stats_at, answered, errors = 0.0, time.time(), 0, 0
     lags: list[float] = []
     while True:
         try:
-            if time.time() - refreshed_at >= policy.refresh_every:
+            if time.time() - refreshed_at >= min(p.refresh_every for p, _ in arms):
                 refreshed_at = time.time()
-                try:
-                    policy.refresh(state)
-                except Exception as e:
-                    print(f"[policy.refresh] {e}")
+                for policy, _ in arms:
+                    try:
+                        policy.refresh(state)
+                    except Exception as e:
+                        print(f"[policy.refresh] {e}")
 
             now = time.time()
             fresh = []
@@ -89,6 +98,7 @@ def main() -> None:
                     fresh.append(r)
             answers = []
             for req in fresh:
+                policy, version = arms[zlib.crc32(req["request_id"].encode()) % len(arms)]
                 try:
                     items = policy.recommend(req, state)
                 except Exception as e:

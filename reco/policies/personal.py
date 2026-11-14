@@ -11,6 +11,12 @@ Multiplicadores:
   brand     × (1 + brand · afinidad del usuario por la marca)
   rebuy     productos que el usuario ya compró: el 62 % de las compras del test son repeticiones y un
             producto ya comprado se compra 6,5× más. Peso (0,5 + 0,5·min(n,4)/4) · exp(-días / rebuy_days)
+Categoría de la sesión (v2): en vivo, un producto de una categoría que el cliente acaba de mirar
+convierte ~5× más que uno de otra categoría, y el sistema viejo solo enseñaba la categoría de la sesión.
+  cat_fill  añade como candidatos los más populares de las categorías vistas (relleno dentro de categoría)
+  off       multiplicador para productos de categorías NO vistas (0 = se descartan; 1 = sin efecto, v1)
+  cat_decay peso de la categoría de la vista k-ésima más antigua: cat_decay^k (1 = todas igual)
+Sin vistas (home) no se aplica.
 Las vistas recientes pesan más cuanto más recientes: × decay^k (k = 0 la última).
 """
 from __future__ import annotations
@@ -28,11 +34,16 @@ import pandas as pd
 
 from .base import Policy
 
-# Ajustados con scripts/tune.py search (búsqueda coordenada sobre ips_ndcg, corte 2026-11-07)
-DEFAULT_WEIGHTS = {
+# v1: ajustados con scripts/tune.py search (ips_ndcg, corte 2026-11-07). Sin lógica de categoría.
+V1 = {
     "self": 0.15, "buy": 1.0, "view": 0.1, "user": 1.0, "ctx": 0.15, "pop": 0.4,
     "brand": 0.5, "rebuy": 1.0, "rebuy_days": 30.0, "decay": 0.6,
+    "cat_fill": 0.0, "off": 1.0, "cat_decay": 1.0,
 }
+# v2: prioriza las categorías de la sesión.
+V2 = {**V1, "cat_fill": 0.5, "off": 0.0}
+VERSIONS = {"v1": V1, "v2": V2}
+DEFAULT_WEIGHTS = V2
 
 
 def _norm_lists(df, key, item, val, top):
@@ -59,24 +70,32 @@ def _group(keys, *cols):
 
 class Personal(Policy):
     name = "personal"
+    version = "v2"
+    refresh_every = 600.0   # en vivo: recalcula las features cada 10 min en segundo plano
+
+    # El índice es de clase: en un A/B varias versiones comparten las mismas features y un solo refresh.
+    _shared: dict = {}
+    _building = False
 
     def __init__(self, until: str | None = None, weights: dict | None = None) -> None:
         super().__init__(until)
-        self.w = {**DEFAULT_WEIGHTS, **(weights or {})}
+        self.w = {**VERSIONS[self.version], **(weights or {})}
 
-    refresh_every = 600.0   # en vivo: recalcula las features cada 10 min en segundo plano
+    @property
+    def ix(self) -> SimpleNamespace:
+        return Personal._shared[self.until]
 
     def fit(self, state):
         """Carga las features del disco (si no hay, las construye). En producción, el primer refresh()
         del bucle las recalcula en segundo plano, así que arrancar con unas antiguas es seguro y rápido."""
-        self.ix = self._index(self.load_features())
-        self._building = False
+        if self.until not in Personal._shared:
+            Personal._shared[self.until] = self._index(self.load_features())
 
     def refresh(self, state):
-        """En vivo: reconstruye las features en un hilo y cambia el índice de golpe al terminar."""
-        if self.until is not None or self._building:
+        """En vivo: reconstruye las features en un proceso aparte y cambia el índice de golpe al terminar."""
+        if self.until is not None or Personal._building:
             return
-        self._building = True
+        Personal._building = True
 
         def work():
             # La descarga y el JSON (600k filas) bloquean el GIL varios segundos: en un proceso aparte
@@ -86,12 +105,12 @@ class Personal(Policy):
             try:
                 subprocess.run([sys.executable, str(ROOT / "scripts" / "build_features.py")], cwd=ROOT,
                                check=True, capture_output=True, timeout=600)
-                self.ix = self._index(features.load(until=None))
+                Personal._shared[None] = self._index(features.load(until=None))
                 print(f"[personal] features actualizadas: {len(self.ix.user_bought)} usuarios con compras")
             except Exception as e:
                 print(f"[personal] refresh falló, sigo con las anteriores: {e}")
             finally:
-                self._building = False
+                Personal._building = False
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -105,6 +124,8 @@ class Personal(Policy):
         items = items.assign(pop=pop / max(pop.max(), 1e-9))
         ix.top_pop = list(items.nlargest(50, "pop")[["product_id", "pop"]].itertuples(index=False, name=None))
         ix.subcat_top = _norm_lists(items, "subcategory", "product_id", "pop", 10)
+        ix.cat_of = dict(zip(items.product_id, items.category))
+        ix.cat_top = _norm_lists(items, "category", "product_id", "pop", 40)
 
         nb = f["item_neighbors"]
         ix.nb_buy = _norm_lists(nb[nb.kind == "buy"], "p", "q", "n", 20)
@@ -125,7 +146,7 @@ class Personal(Policy):
         return ix
 
     def recommend(self, req, state):
-        w, ix = self.w, self.ix   # una sola lectura: si el hilo de refresh cambia el índice, no nos afecta
+        w, ix = self.w, self.ix   # una sola lectura: si el refresh cambia el índice, no nos afecta
         s: dict[str, float] = defaultdict(float)
 
         views = req.get("recent_views") or []
@@ -155,11 +176,37 @@ class Personal(Policy):
             for q, n, t in bought:
                 s[q] += w["rebuy"] * (0.5 + 0.125 * n) * math.exp(-max(now - t, 0) / 86400 / w["rebuy_days"])
 
+        # Categorías de la sesión: relleno dentro de categoría y penalización (o descarte) de lo de fuera
+        cats: dict[str, float] = {}
+        if views and (w["cat_fill"] or w["off"] != 1):
+            for k, v in enumerate(reversed(views)):
+                c = ix.cat_of.get(v["product_id"])
+                if c is not None:
+                    cats[c] = max(cats.get(c, 0.0), w["cat_decay"] ** k)
+            for c, a in cats.items():
+                for q, n in ix.cat_top.get(c, ()):
+                    s[q] += w["cat_fill"] * a * n
+
         brands = ix.user_brand.get(user)
         if brands:
             for q in s:
                 s[q] *= 1 + w["brand"] * brands.get(ix.brand_of.get(q), 0)
+
+        if cats and w["off"] != 1:
+            off = w["off"]
+            for q in list(s):
+                if ix.cat_of.get(q) not in cats:
+                    if off:
+                        s[q] *= off
+                    else:
+                        del s[q]
         return sorted(s, key=s.get, reverse=True)[:10]
+
+
+class PersonalV1(Personal):
+    """Leattner.v1 congelada (sin lógica de categoría), para comparar en A/B."""
+    name = "personal_v1"
+    version = "v1"
 
 
 def _epoch(ts) -> float:
