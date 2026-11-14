@@ -186,7 +186,10 @@ class BirdRank(BirdV2):
     bird_v2 (aprende el orden dentro de un carrusel, no el nivel absoluto); su sitio es dentro de la mezcla."""
     name = "bird_v2_rank"
     model_name = "v2_rank"
-    final_name = "v2_rank_live"
+    # En vivo: ranking entrenado con el histórico + el primer 80 % del feedback en vivo del 14/11
+    # (hit@1 0,42 frente a 0,36 del entrenado solo con histórico, sobre el último 20 % en vivo).
+    # Para volver al anterior: final_name = "v2_rank_live".
+    final_name = "v2_rank_fb80"
 
 
 class BirdBlend(Policy):
