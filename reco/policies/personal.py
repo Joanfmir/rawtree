@@ -16,6 +16,8 @@ Las vistas recientes pesan más cuanto más recientes: × decay^k (k = 0 la últ
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
 import threading
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -34,12 +36,24 @@ DEFAULT_WEIGHTS = {
 
 
 def _norm_lists(df, key, item, val, top):
-    """{key: [(item, val / max_val_of_key), ...]} ordenado por val, máximo `top` por clave."""
-    out = {}
+    """{key: [(item, val / max_val_of_key), ...]} ordenado por val desc, máximo `top` por clave."""
     df = df.sort_values([key, val], ascending=[True, False])
-    for k, g in df.groupby(key, sort=False):
-        v = g[val].to_numpy(dtype=float)[:top]
-        out[k] = list(zip(g[item].to_numpy()[:top], v / max(v[0], 1e-9)))
+    out: dict = {}
+    cur, lst, vmax = object(), None, 1.0
+    for k, i, v in zip(df[key].tolist(), df[item].tolist(), df[val].tolist()):
+        if k != cur:
+            cur, lst, vmax = k, [], max(float(v), 1e-9)
+            out[k] = lst
+        if len(lst) < top:
+            lst.append((i, v / vmax))
+    return out
+
+
+def _group(keys, *cols):
+    """{key: [(col1, col2, ...), ...]} conservando el orden de las filas."""
+    out: dict = {}
+    for k, *vals in zip(keys, *cols):
+        out.setdefault(k, []).append(tuple(vals))
     return out
 
 
@@ -53,9 +67,8 @@ class Personal(Policy):
     refresh_every = 600.0   # en vivo: recalcula las features cada 10 min en segundo plano
 
     def fit(self, state):
-        if self.until is None:   # producción: features frescas al arrancar (~15 s)
-            from .. import features
-            features.build(until=None, verbose=False)
+        """Carga las features del disco (si no hay, las construye). En producción, el primer refresh()
+        del bucle las recalcula en segundo plano, así que arrancar con unas antiguas es seguro y rápido."""
         self.ix = self._index(self.load_features())
         self._building = False
 
@@ -66,9 +79,14 @@ class Personal(Policy):
         self._building = True
 
         def work():
+            # La descarga y el JSON (600k filas) bloquean el GIL varios segundos: en un proceso aparte
+            # no frenan el bucle de respuestas. Aquí solo leemos el Parquet y montamos el índice (~1,5 s).
             from .. import features
+            from ..config import ROOT
             try:
-                self.ix = self._index(features.build(until=None, verbose=False))
+                subprocess.run([sys.executable, str(ROOT / "scripts" / "build_features.py")], cwd=ROOT,
+                               check=True, capture_output=True, timeout=600)
+                self.ix = self._index(features.load(until=None))
                 print(f"[personal] features actualizadas: {len(self.ix.user_bought)} usuarios con compras")
             except Exception as e:
                 print(f"[personal] refresh falló, sigo con las anteriores: {e}")
@@ -92,16 +110,15 @@ class Personal(Policy):
         ix.nb_buy = _norm_lists(nb[nb.kind == "buy"], "p", "q", "n", 20)
         ix.nb_view = _norm_lists(nb[nb.kind == "view"], "p", "q", "n", 20)
 
-        us = f["user_subcat"]
+        us = f["user_subcat"].sort_values(["user_id", "w"], ascending=[True, False])
         us = us.assign(a=us.w / us.groupby("user_id").w.transform("sum"))
-        ix.user_subcat = {u: list(zip(g.subcategory, g.a))[:5] for u, g in us.groupby("user_id", sort=False)}
+        ix.user_subcat = {u: v[:5] for u, v in _group(us.user_id.tolist(), us.subcategory.tolist(), us.a.tolist()).items()}
         ub = f["user_brand"]
         ub = ub.assign(a=ub.w / ub.groupby("user_id").w.transform("max"))
-        ix.user_brand = {u: dict(zip(g.brand, g.a)) for u, g in ub.groupby("user_id", sort=False)}
+        ix.user_brand = {u: dict(v) for u, v in _group(ub.user_id.tolist(), ub.brand.tolist(), ub.a.tolist()).items()}
         up = f["user_purchases"]
         t = (pd.to_datetime(up.last_ts) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
-        ix.user_bought = {u: list(zip(g.product_id, g.n.clip(upper=4), t[g.index]))
-                          for u, g in up.groupby("user_id", sort=False)}
+        ix.user_bought = _group(up.user_id.tolist(), up.product_id.tolist(), up.n.clip(upper=4).tolist(), t.tolist())
 
         cp = f["context_popular"].assign(ctx=lambda d: list(zip(d.device, d.region)))
         ix.ctx_pop = _norm_lists(cp, "ctx", "product_id", "n", 30)
