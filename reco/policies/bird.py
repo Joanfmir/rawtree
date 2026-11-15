@@ -248,6 +248,19 @@ class BirdV5DeltaRetrained(BirdV5Delta):
     final_name = "v5_live2"
 
 
+class BirdV5Organic(BirdV5Delta):
+    """Política "bird_v5_org" (v8-bird): v7-bird con un modelo que además aprende de las compras orgánicas.
+
+    Mismas 81 features y mismo estado. El modelo (data/bird/v5_org) se entrena con histórico + nuestro
+    feedback + filas "org": para cada petición del stream, lo que el usuario compró por su cuenta en los
+    30 min siguientes (positivo) frente a ~20 productos al azar (negativos). Esas filas no dependen de lo
+    que enseñó nuestro carrusel: dicen qué quería el usuario también cuando no pulsó nada.
+    Ver `python scripts/bird_v5.py compare-org`. Si falta v5_org arranca con v5_fresh: mirar el log.
+    """
+    name = "bird_v5_org"
+    final_name = "v5_org"
+
+
 class _V5Hub:
     """Estado de servicio de v5 compartido entre brazos: una sola descarga, una sola copia en memoria.
 

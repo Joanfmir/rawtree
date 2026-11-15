@@ -42,7 +42,14 @@ y se añade a esta tabla y a `BIRD_VERSIONS` en `reco/policies/__init__.py`.
 
 El nombre de versión funciona como política: `make dry POLICY=v3-bird`, `make up AB=<otros brazos>,v3-bird=v3-bird`.
 Código en `reco/bird/` y `reco/policies/bird.py`; entrenamiento y evaluación con `scripts/bird.py` y
-`scripts/bird_blend.py`. La siguiente versión será **v8-bird**.
+`scripts/bird_blend.py`. La siguiente versión será **v9-bird**.
+
+v8-bird (`bird_v5_org`, EXPERIMENTAL) es v7-bird con un modelo (`data/bird/v5_org`) que además se entrena con
+compras orgánicas: por cada petición, lo que el usuario compró por su cuenta en los 30 min siguientes frente a
+~20 productos al azar (`dataset --parts org`, `train --final --org-weight 0.1`, `compare-org`). Offline (15/11):
+empate con el modelo sin orgánicas al ordenar nuestro carrusel (ΔNDCG −0,008, IC [−0,025, +0,009]) y mejor en
+compras orgánicas (0,725 frente a 0,685). El modelo guardado se paró en 50 árboles y en su validación queda por
+debajo de v7 (NDCG 0,674 frente a 0,707): no llevarlo a la ronda final sin que gane un A/B.
 
 v7-bird (`bird_v5_delta_r2`) es v6-bird con el modelo reentrenado `data/bird/v5_live2` (mismo dataset v5, más
 feedback en vivo). Reentrenar: `python scripts/bird_v5.py dataset --refresh-live --parts live` y

@@ -39,8 +39,8 @@ def load(*names: str) -> pd.DataFrame:
 def cmd_dataset(args) -> None:
     from reco.bird import build_v5 as b5
     if args.refresh_live:   # lo de hoy cambia cada minuto; el histórico no
-        for f in list(b5.RAW.glob("ui_live_*")) + [b5.RAW / n for n in (
-                "live_until.json", "live_sessions.pkl", "item_live10.parquet", "feedback10.parquet", "catalog.pkl",
+        for f in list(b5.RAW.glob("ui_live_*")) + list(b5.RAW.glob("ui_org_*")) + [b5.RAW / n for n in (
+                "live_until.json", "live_sessions.pkl", "org_sessions.pkl", "org_pairs.parquet", "item_live10.parquet", "feedback10.parquet", "catalog.pkl",
                 "updates.parquet", "ctx_device.parquet", "ctx_region.parquet")]:
             f.unlink(missing_ok=True)
     parts = b5.split(b5.build(refresh=args.refresh, parts=tuple(args.parts)))
@@ -53,6 +53,11 @@ def cmd_dataset(args) -> None:
     out = b5.save(parts)
     for name, part in parts.items():
         print(f"{name:<11} {dataset.describe(part, V5)}")
+    if "org" in parts:
+        o = parts["org"]
+        print(f"org: {o.target_purchase.mean():.3f} de las filas son compras · ya comprado antes: "
+              f"{o[o.target_purchase == 1].already_purchased.mean():.3f} de las compras · compra de algo recién visto: "
+              f"{o[o.target_purchase == 1].recently_viewed.mean():.3f}")
     print(f"→ {out}  ({len(V5.features)} features)")
 
 
@@ -93,11 +98,24 @@ def paired_ndcg(te: pd.DataFrame, a: np.ndarray, b: np.ndarray, target: str, n: 
 
 
 def fit(schema, tr: pd.DataFrame, va: pd.DataFrame, cold: float, live_weight: float, iterations: int | None = None,
-        threads: int = 6, ips_clip: float = 0.0) -> BirdModel:
+        threads: int = 6, ips_clip: float = 0.0, org_weight: float = 1.0) -> BirdModel:
     from reco.bird.build_v5 import simulate_cold
     tr = simulate_cold(tr, cold)
-    if live_weight != 1.0:
-        tr = tr.assign(sample_weight=tr.sample_weight * np.where(tr.source == "live", live_weight, 1.0))
+    org = (tr.source == "org").to_numpy()
+    if live_weight != 1.0 or org.any():
+        w = np.where(tr.source == "live", live_weight, 1.0)
+        tr = tr.assign(sample_weight=tr.sample_weight * w)
+    if org.any():
+        from reco.bird.build_v5 import ORG_NEG_MOD
+        # Filas orgánicas: dos correcciones para que no choquen con las del carrusel.
+        #  1. Cada negativo es 1 de cada ORG_NEG_MOD productos del catálogo: pesa ORG_NEG_MOD. Sin esto la
+        #     tasa de compra de estas filas (6,7 %) es ~60 veces la real y descalibra todo el modelo.
+        #  2. No tienen hueco de carrusel: position va vacía. CatBoost trata el vacío como un valor aparte,
+        #     así que el modelo puede separar "orgánico" de "carrusel" sin una feature nueva; al servir,
+        #     position = 1 y manda lo aprendido del carrusel.
+        w = np.where(org, org_weight * np.where(tr.target_purchase.to_numpy() == 0, float(ORG_NEG_MOD), 1.0), 1.0)
+        tr = tr.assign(sample_weight=tr.sample_weight * w,
+                       position=np.where(org, np.nan, tr.position.to_numpy(dtype=float)))
     if ips_clip > 0:
         # El sistema viejo enseñaba sobre todo best sellers. Pesar cada impresión del histórico por
         # 1/propensity (acotado y normalizado a media 1) la acerca a "todos los productos por igual", que
@@ -162,6 +180,49 @@ def cmd_compare(args) -> None:
     print(best.importance().round(2).head(args.top).to_string())
 
 
+def org_before(org: pd.DataFrame, cut) -> pd.DataFrame:
+    """Filas orgánicas cuya ventana de compra (30 min) acaba antes de `cut`: no ven nada del periodo de validación."""
+    from reco.bird.build_v5 import ORG_WINDOW
+    return org[org.timestamp < cut - pd.Timedelta(minutes=ORG_WINDOW)]
+
+
+def cmd_compare_org(args) -> None:
+    """¿Ayuda añadir las compras orgánicas al entrenamiento? Mismo modelo y mismas features; lo único que
+    cambia son las filas. Se mide donde importa: ordenar los 10 productos de NUESTRO carrusel en las últimas
+    horas (que ningún modelo ha visto). Las filas orgánicas usadas son anteriores a ese periodo."""
+    hist = pd.concat([no_rebuy(load(n)) for n in ("train", "validation", "test")], ignore_index=True)
+    live, org = no_rebuy(load("live")), no_rebuy(load("org"))
+    live_tr, live_va, live_te = live_split(live, args.valid_share, args.test_share)
+    org_tr = org_before(org, live_va.timestamp.min())
+    org_te = org[org.timestamp >= live_te.timestamp.min()]
+    print(f"live  train {dataset.describe(live_tr, V5)}\n      valid {dataset.describe(live_va, V5)}\n"
+          f"      test  {dataset.describe(live_te, V5)}")
+    print(f"org   train {len(org_tr):,} filas · {org_tr.request_id.nunique():,} peticiones · "
+          f"{int(org_tr.target_purchase.sum()):,} compras · hasta {org_tr.timestamp.max():%H:%M}\n"
+          f"      test  {len(org_te):,} filas · {int(org_te.target_purchase.sum()):,} compras")
+    base_tr = pd.concat([hist, live_tr], ignore_index=True)
+    te1 = live_te.assign(position=V5.reference_position)
+    scores, rows = {}, []
+    setups = {"sin orgánicas": None, **{f"orgánicas ×{w:g}": w for w in args.org_weights}}
+    for name, w in setups.items():
+        t = time.time()
+        tr = base_tr if w is None else pd.concat([base_tr, org_tr], ignore_index=True)
+        m = fit(V5, tr, live_va, args.cold_share, args.live_weight, threads=args.threads, org_weight=w or 1.0)
+        scores[name] = m.predict(te1)
+        print(f"  {name:<16} {m.info['trees']} árboles  {time.time() - t:.0f}s")
+        for target in ("target_purchase", "target_click"):
+            rows.append({"modelo": name, "test": f"carrusel · {target.split('_')[1]}", **rank_report(live_te, scores[name], target)})
+        if len(org_te):
+            rows.append({"modelo": name, "test": "orgánico · compra", **rank_report(org_te, m.predict(org_te), "target_purchase")})
+    print("\n" + pd.DataFrame(rows).set_index(["test", "modelo"]).sort_index().round(4).to_string())
+    print("\nΔNDCG en nuestro carrusel frente a «sin orgánicas» (IC 95 % por bootstrap de usuarios):")
+    for name in list(setups)[1:]:
+        for target in ("target_purchase", "target_click"):
+            d, lo, hi = paired_ndcg(live_te, scores["sin orgánicas"], scores[name], target)
+            verdict = "MEJOR" if lo > 0 else "PEOR" if hi < 0 else "empate"
+            print(f"  {name:<16} {target.split('_')[1]:<9} {d:+.4f}  [{lo:+.4f}, {hi:+.4f}]  {verdict}")
+
+
 def cmd_train(args) -> None:
     schema = SCHEMAS[args.schema]
     hist_tr, hist_va, hist_te = (no_rebuy(load(n)) for n in ("train", "validation", "test"))
@@ -170,14 +231,21 @@ def cmd_train(args) -> None:
         # las últimas horas del vivo como validación, escalado a los datos de más.
         live = no_rebuy(load("live"))
         live_tr, live_va = dataset.split_by_time(live, args.valid_share)
-        probe = fit(schema, pd.concat([hist_tr, hist_va, hist_te, live_tr], ignore_index=True), live_va,
-                    args.cold_share, args.live_weight, threads=args.threads, ips_clip=args.ips_clip)
+        extra_tr = extra_all = []
+        if args.org_weight > 0:   # compras orgánicas: en la pasada de prueba, solo las anteriores a la validación
+            org = no_rebuy(load("org"))
+            extra_tr, extra_all = [org_before(org, live_va.timestamp.min())], [org]
+            print(f"filas orgánicas: {len(org):,} ({int(org.target_purchase.sum()):,} compras), peso ×{args.org_weight:g}")
+        probe = fit(schema, pd.concat([hist_tr, hist_va, hist_te, live_tr, *extra_tr], ignore_index=True), live_va,
+                    args.cold_share, args.live_weight, threads=args.threads, ips_clip=args.ips_clip,
+                    org_weight=args.org_weight or 1.0)
         trees = max(int(probe.info["trees"] * 1.05), 50)
         print(f"parada temprana (validación: últimas horas en vivo): {probe.info['trees']} árboles → final {trees}")
         print(metrics.show(probe.info["metrics"]))
-        bird = fit(schema, pd.concat([hist_tr, hist_va, hist_te, live], ignore_index=True), live_va,
-                   args.cold_share, args.live_weight, iterations=trees, threads=args.threads, ips_clip=args.ips_clip)
-        bird.info["all_data"] = True
+        bird = fit(schema, pd.concat([hist_tr, hist_va, hist_te, live, *extra_all], ignore_index=True), live_va,
+                   args.cold_share, args.live_weight, iterations=trees, threads=args.threads, ips_clip=args.ips_clip,
+                   org_weight=args.org_weight or 1.0)
+        bird.info["all_data"], bird.info["org_weight"] = True, args.org_weight
     else:
         # evaluación offline (make offline): solo datos anteriores al 07/11, como v2_fresh
         bird = fit(schema, hist_tr, hist_va, args.cold_share, 1.0, threads=args.threads, ips_clip=args.ips_clip)
@@ -242,7 +310,8 @@ def main() -> None:
     d = sub.add_parser("dataset")
     d.add_argument("--refresh", action="store_true", help="volver a descargar todo")
     d.add_argument("--refresh-live", action="store_true", help="volver a descargar solo la parte de hoy")
-    d.add_argument("--parts", nargs="+", default=["hist", "live"], choices=["hist", "live"])
+    d.add_argument("--parts", nargs="+", default=["hist", "live"], choices=["hist", "live", "org"],
+                   help="org = compras orgánicas tras cada petición + negativos al azar (no depende del carrusel)")
     d.set_defaults(fn=cmd_dataset)
     c = sub.add_parser("compare")
     c.add_argument("--schemas", nargs="*", default=[], help="esquemas extra a comparar")
@@ -253,8 +322,13 @@ def main() -> None:
     t.add_argument("--final", action="store_true", help="modelo de producción: histórico + vivo")
     t.add_argument("--ips-clip", type=float, default=0.0,
                    help="pesar el histórico por 1/propensity acotado a este valor (0 = no)")
+    t.add_argument("--org-weight", type=float, default=0.0,
+                   help="con --final: añadir las filas orgánicas con este peso (0 = no usarlas)")
     t.set_defaults(fn=cmd_train)
-    for p in (c, t):
+    co = sub.add_parser("compare-org", help="mismo modelo con y sin filas orgánicas, medido en nuestro carrusel")
+    co.add_argument("--org-weights", type=float, nargs="+", default=[0.1, 0.03])
+    co.set_defaults(fn=cmd_compare_org)
+    for p in (c, t, co):
         p.add_argument("--cold-share", type=float, default=0.3)
         p.add_argument("--live-weight", type=float, default=3.0, help="peso de las filas en vivo frente a las del histórico")
         p.add_argument("--valid-share", type=float, default=0.15)

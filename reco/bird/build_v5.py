@@ -96,11 +96,41 @@ def live_selected(until: str) -> str:
             f"(f.clicked::String != '' OR cityHash64(f.request_id::String) % {LIVE_MOD} = 0)")
 
 
-def user_item_sql(k: int, chunks: int, live: bool, until: str | None = None) -> str:
+ORG_WINDOW = 30        # minutos tras la petición en los que una compra orgánica cuenta como "lo que quería"
+ORG_NEG_MOD = 270      # 1 de cada 270 productos del catálogo como negativo de cada petición (~20)
+
+
+def org_pairs_sql(until: str, part: str = "1") -> str:
+    """Filas orgánicas: (petición, producto, pos). No dependen de lo que enseñó nuestro carrusel.
+      pos = 1  el usuario compró ese producto POR SU CUENTA (shop.events) en los ORG_WINDOW min siguientes
+      pos = 0  ~20 productos del catálogo de ese momento elegidos por hash (los mismos en cada ejecución)
+    Solo peticiones con alguna compra orgánica después, y con los ORG_WINDOW min ya observados."""
+    r = (f"(SELECT request_id::String AS request_id, user_id::String AS user_id, ts::DateTime64(3) AS ts "
+         f"FROM shop.requests WHERE ts::DateTime64(3) >= '{LIVE_START}' "
+         f"AND ts::DateTime64(3) < toDateTime64('{until}', 3) - INTERVAL {ORG_WINDOW} MINUTE AND {part})")
+    b = (f"(SELECT user_id::String AS user_id, product_id::String AS product_id, ts::DateTime64(3) AS ts "
+         f"FROM shop.events WHERE event_type::String = 'purchase' AND ts::DateTime64(3) < '{until}' AND {part})")
+    pos = (f"(SELECT DISTINCT r.request_id AS request_id, r.user_id AS user_id, r.ts AS ts, b.product_id AS product_id "
+           f"FROM {r} AS r INNER JOIN {b} AS b ON b.user_id = r.user_id "
+           f"WHERE b.ts > r.ts AND b.ts <= r.ts + INTERVAL {ORG_WINDOW} MINUTE)")
+    neg = (f"(SELECT q.request_id AS request_id, q.user_id AS user_id, q.ts AS ts, c.product_id AS product_id "
+           f"FROM (SELECT DISTINCT request_id, user_id, ts FROM {pos}) AS q "
+           f"CROSS JOIN (SELECT product_id, created_at FROM {catalog_sql()}) AS c "
+           f"WHERE cityHash64(q.request_id, c.product_id) % {ORG_NEG_MOD} = 0 "
+           f"AND toDateTime64(c.created_at, 3) <= q.ts)")
+    return (f"SELECT request_id, any(user_id) AS user_id, any(ts) AS ts, product_id, max(pos) AS pos FROM ("
+            f"SELECT request_id, user_id, ts, product_id, 1 AS pos FROM {pos} UNION ALL "
+            f"SELECT request_id, user_id, ts, product_id, 0 AS pos FROM {neg}) GROUP BY request_id, product_id")
+
+
+def user_item_sql(k: int, chunks: int, live: bool, until: str | None = None, org: bool = False) -> str:
     """Por (petición, producto enseñado): recuentos de la historia del usuario ANTERIOR a la petición.
-    De ellos salen las features de usuario, afinidad y usuario × producto (feat5.user_feats)."""
+    De ellos salen las features de usuario, afinidad y usuario × producto (feat5.user_feats).
+    org=True: en vez de los productos enseñados, los pares de org_pairs_sql (compras orgánicas + negativos)."""
     part = f"cityHash64(user_id::String) % {chunks} = {k}"
-    if live:
+    if org:
+        shown = f"SELECT request_id, user_id, ts, product_id FROM ({org_pairs_sql(until, part)})"
+    elif live:
         shown = f"""SELECT f.request_id::String AS request_id, r.user_id::String AS user_id,
                            r.ts::DateTime64(3) AS ts, arrayJoin(f.shown::Array(String)) AS product_id
                     FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r
@@ -529,6 +559,15 @@ def _frame(sess: pd.DataFrame, source: str, items: feat5.Items, ui: pd.DataFrame
         df[name] = sf[:, i]
     say(f"   [{source}] sesión lista")
 
+    is_new = np.repeat(sess.is_new_user.to_numpy(bool), 10) if live else None
+    return _finish(df, ui, items, flat, is_new)
+
+
+def _finish(df: pd.DataFrame, ui: pd.DataFrame, items: feat5.Items, flat: np.ndarray,
+            is_new: np.ndarray | None) -> pd.DataFrame:
+    """Parte común a todas las filas: historia del usuario (SQL) → features de usuario, afinidad y par.
+    `is_new`: marca is_new_user de la petición por fila; None = histórico (nuevo = sin eventos anteriores)."""
+    live = is_new is not None
     # usuario × producto (SQL) → features de usuario y afinidad
     df = df.merge(ui, on=["request_id", "product_id"], how="left")
     counts = ["up_views", "up_carts", "up_buys", "up_c_clicks", "up_c_buys", "u_sub_w_7d",
@@ -537,7 +576,7 @@ def _frame(sess: pd.DataFrame, source: str, items: feat5.Items, ui: pd.DataFrame
     tsn = df.timestamp.dt.tz_localize(None)
     for name, col in feat5.user_feats({k: df[k].to_numpy() for k in feat5.USER_AGG}, items.logp[flat]).items():
         df[name] = col
-    df["is_new_user"] = (np.repeat(sess.is_new_user.to_numpy(bool), 10) if live else df.u_events == 0).astype("int8")
+    df["is_new_user"] = (is_new if live else (df.u_events == 0).to_numpy()).astype("int8")
     df["previous_purchase_count"] = df.up_buys + df.up_c_buys
     df["already_purchased"] = (df.previous_purchase_count > 0).astype("int8")
     df["up_days_since_seen"] = _days_since(tsn, df.pop("up_last_seen"))
@@ -553,6 +592,125 @@ def _frame(sess: pd.DataFrame, source: str, items: feat5.Items, ui: pd.DataFrame
     for col in df.select_dtypes("float64").columns.difference(["propensity", "sample_weight", "revenue_eur"]):
         df[col] = df[col].astype("float32")
     return df
+
+
+def load_org(until: str, refresh: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(peticiones, pares) de las filas orgánicas. Pares: request_id, product_id, pos."""
+    def pairs() -> pd.DataFrame:
+        parts = [pd.DataFrame(_query(org_pairs_sql(until, f"cityHash64(user_id::String) % {LIVE_CHUNKS} = {k}")))
+                 for k in range(LIVE_CHUNKS)]
+        return pd.concat(parts, ignore_index=True)[["request_id", "product_id", "pos"]]
+
+    def requests() -> pd.DataFrame:
+        parts = []
+        for k in range(LIVE_CHUNKS):   # `context` y `recent_views` no pasan por un JOIN: se filtra con IN
+            part = f"cityHash64(user_id::String) % {LIVE_CHUNKS} = {k}"
+            parts.append(pd.DataFrame(_query(f"""SELECT request_id::String AS request_id,
+                    toString(ts::DateTime64(3)) AS ts, user_id::String AS user_id, is_new_user::Bool AS is_new_user,
+                    context, recent_views FROM shop.requests
+                WHERE {part} AND request_id::String IN (SELECT request_id FROM ({org_pairs_sql(until, part)}))""")))
+        df = pd.concat(parts, ignore_index=True).drop_duplicates("request_id")
+        df["recent_views"] = df.recent_views.apply(lambda v: list(v) if v is not None else [])
+        return df.sort_values(["ts", "request_id"]).reset_index(drop=True)
+
+    return _cached("org_sessions.pkl", requests, refresh), _cached("org_pairs.parquet", pairs, refresh)
+
+
+def _frame_org(sess: pd.DataFrame, pairs: pd.DataFrame, items: feat5.Items, ui: pd.DataFrame, tl: Timeline,
+               fbt: FeedbackTimeline, ctx: dict, daily: pd.DataFrame, updates: pd.DataFrame, cuts: list[str],
+               say) -> pd.DataFrame:
+    """Filas orgánicas con las mismas features que las demás. Aquí no hay carrusel: cada petición trae sus
+    compras orgánicas (target 1) y ~20 productos al azar (target 0), todos con la posición de referencia."""
+    pairs = pairs[pairs.product_id.isin(items.idx) & pairs.request_id.isin(set(sess.request_id))]
+    order = {r: i for i, r in enumerate(sess.request_id)}
+    ri = pairs.request_id.map(order).to_numpy()
+    by = np.argsort(ri, kind="stable")
+    pairs, ri = pairs.iloc[by].reset_index(drop=True), ri[by]
+    flat = pairs.product_id.map(items.idx).to_numpy()
+    n = len(pairs)
+    ts_req = sess.ts.to_numpy().astype("datetime64[ns]")
+    ts_row = ts_req[ri]
+    pos = pairs.pos.to_numpy(dtype="int8")
+    df = pd.DataFrame({
+        "request_id": pairs.request_id.to_numpy(), "user_id": sess.user_id.to_numpy()[ri],
+        "product_id": items.ids[flat], "timestamp": pd.to_datetime(ts_row, utc=True),
+        "position": np.ones(n, dtype="int8"), "target_purchase": pos, "target_click": pos,
+        "propensity": 1.0, "sample_weight": 1.0, "revenue_eur": 0.0, "source": "org", "served_by": "organic",
+    })
+    ctx_val = {}
+    for key in ("page", "device", "region"):
+        ctx_val[key] = sess.context.apply(lambda c: (c or {}).get(key) or "UNKNOWN").to_numpy()
+        df[key] = ctx_val[key][ri]
+    for col, arr in (("category", "cat"), ("subcategory", "sub"), ("brand", "brand")):
+        df[col] = np.array(list(items.codes[arr]), dtype=object)[getattr(items, arr)[flat]]
+    df["attr1"], df["attr2"] = items.attr1[flat], items.attr2[flat]
+    price = items.base_price[flat].copy()
+    if len(updates):   # precio en el instante de la petición
+        up = updates.assign(ts=pd.to_datetime(updates.ts).astype("datetime64[ns]")).sort_values("ts")
+        left = pd.DataFrame({"ts": ts_row.astype("datetime64[ns]"), "product_id": items.ids[flat], "row": np.arange(n)})
+        m = pd.merge_asof(left.sort_values("ts"), up[["ts", "product_id", "price_eur"]], on="ts", by="product_id",
+                          allow_exact_matches=False).sort_values("row")
+        got = m.price_eur.to_numpy(dtype=float)
+        price = np.where(np.isnan(got), price, got)
+    df["price_eur"] = price.astype("float32")
+    df["it_discount"] = np.clip(1.0 - price / items.base_price[flat], 0.0, 1.0)
+    df["it_price_vs_sub"] = items.price_vs_sub[flat]
+    df["it_age_days"] = (ts_row - items.created[flat]) / np.timedelta64(1, "D")
+
+    # producto: popularidad hasta el último tramo completo
+    edge = tl.edge(ts_req.astype(np.int64))[ri]
+    uniq, row_u = np.unique(edge, return_inverse=True)
+    cols = {name: np.zeros(n, dtype=np.float32) for name in feat5.ITEM_POP + ("it_buys_7d", "it_views_7d", "it_buys_1d")}
+    for lo in range(0, len(uniq), 128):
+        at = uniq[lo:lo + 128]
+        sel = (row_u >= lo) & (row_u < lo + len(at))
+        counts = tl.counts(at)
+        block = feat5.item_pop(counts, items.sub)
+        for name in feat5.ITEM_POP:
+            cols[name][sel] = block[name][row_u[sel] - lo, flat[sel]]
+        for name, key in (("it_buys_7d", "buys_7d"), ("it_views_7d", "views_7d"), ("it_buys_1d", "buys_1d")):
+            cols[name][sel] = counts[key][row_u[sel] - lo, flat[sel]]
+    for name, col in cols.items():
+        df[name] = col
+    df["it_trend"] = np.log1p(df.it_buys_1d * 7) - np.log1p(df.it_buys_7d)
+
+    # producto: carrusel del histórico (todo) y nuestro carrusel (hasta el último tramo de 10 min)
+    days = pd.date_range(bd.HISTORY_FROM, "2026-11-15", freq="D")
+    d = daily[daily.product_id.isin(items.idx)]
+    tot = d.groupby("product_id")[["c_impr", "c_clicks", "c_buys"]].sum().reindex(items.ids, fill_value=0.0)
+    del days
+    rates = feat5.carousel_rates(tot.c_impr.to_numpy(), tot.c_clicks.to_numpy(), tot.c_buys.to_numpy())
+    for name, m in rates.items():
+        df[name] = m[0, flat]
+    for name, col in fbt.lifts(edge - H_LIVE, flat).items():
+        df[name] = col
+
+    # contexto: compras por dispositivo / región anteriores al inicio del stream
+    for key in ("device", "region"):
+        code, tables = ctx[key]
+        k = np.array([code.get(v, -1) for v in ctx_val[key]])[ri]
+        for name, m in tables[len(CTX_CUTS) - 1].items():
+            df[name] = np.where(k >= 0, m[np.clip(k, 0, None), flat], 0.0).astype(np.float32)
+    say("   [org] producto y contexto listos")
+
+    # sesión: la misma función que el servicio, una vez por petición
+    which = np.clip(np.searchsorted(np.array(cuts, dtype="datetime64[ns]"), ts_req, side="right") - 1, 0, None)
+    nbs = {w: neighbors(cuts[w], items) for w in np.unique(which)}
+    sf = np.zeros((n, len(feat5.SESSION)), dtype=np.float32)
+    start = np.searchsorted(ri, np.arange(len(sess) + 1))
+    for r, (views, w, now) in enumerate(zip(sess.recent_views, which, ts_req)):
+        a, b = start[r], start[r + 1]
+        if a == b:
+            continue
+        v, secs = feat5.parse_views(items, views, now)
+        block = feat5.session_block(items, v, secs, nbs[w])
+        p = flat[a:b]
+        for j, name in enumerate(feat5.SESSION):
+            sf[a:b, j] = block[name][p]
+    for j, name in enumerate(feat5.SESSION):
+        df[name] = sf[:, j]
+    say("   [org] sesión lista")
+    return _finish(df, ui, items, flat, sess.is_new_user.to_numpy(bool)[ri])
 
 
 def build(refresh: bool = False, verbose: bool = True, parts: tuple[str, ...] = ("hist", "live")) -> dict[str, pd.DataFrame]:
@@ -588,6 +746,14 @@ def build(refresh: bool = False, verbose: bool = True, parts: tuple[str, ...] = 
         say(f"live: {len(sess):,} peticiones ({(sess.clicked != '').sum():,} con clic, "
             f"{(sess.purchased != '').sum():,} con compra)  [{time.time() - t0:.0f}s]")
         out["live"] = _frame(sess, "live", items, ui, tl, fbt, ctx, daily, updates, live_cuts(until), say)
+    if "org" in parts:
+        sess, pairs = load_org(until, refresh)
+        sess["ts"] = pd.to_datetime(sess.ts)
+        ui = _chunks("ui_org", LIVE_CHUNKS,
+                     lambda k: user_item_sql(k, LIVE_CHUNKS, live=True, until=until, org=True), refresh, say)
+        say(f"org: {len(sess):,} peticiones con compra orgánica en {ORG_WINDOW} min · {len(pairs):,} pares "
+            f"({int(pairs.pos.sum()):,} compras)  [{time.time() - t0:.0f}s]")
+        out["org"] = _frame_org(sess, pairs, items, ui, tl, fbt, ctx, daily, updates, live_cuts(until), say)
     for name, df in out.items():
         say(f"{name}: {len(df):,} filas × {df.shape[1]} columnas  [{time.time() - t0:.0f}s]")
     return out
@@ -604,6 +770,8 @@ def split(parts: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
                     "test": df[df.timestamp >= t].reset_index(drop=True)})
     if "live" in parts:
         out["live"] = parts["live"].sort_values(["timestamp", "request_id", "position"]).reset_index(drop=True)
+    if "org" in parts:
+        out["org"] = parts["org"].sort_values(["timestamp", "request_id"]).reset_index(drop=True)
     return out
 
 
