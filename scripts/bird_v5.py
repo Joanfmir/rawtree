@@ -236,12 +236,16 @@ def cmd_train(args) -> None:
             org = no_rebuy(load("org"))
             extra_tr, extra_all = [org_before(org, live_va.timestamp.min())], [org]
             print(f"filas orgánicas: {len(org):,} ({int(org.target_purchase.sum()):,} compras), peso ×{args.org_weight:g}")
-        probe = fit(schema, pd.concat([hist_tr, hist_va, hist_te, live_tr, *extra_tr], ignore_index=True), live_va,
-                    args.cold_share, args.live_weight, threads=args.threads, ips_clip=args.ips_clip,
-                    org_weight=args.org_weight or 1.0)
-        trees = max(int(probe.info["trees"] * 1.05), 50)
-        print(f"parada temprana (validación: últimas horas en vivo): {probe.info['trees']} árboles → final {trees}")
-        print(metrics.show(probe.info["metrics"]))
+        if args.trees:   # nº de árboles fijo: sin pasada de prueba (la parada temprana a veces corta en decenas)
+            trees = args.trees
+            print(f"nº de árboles fijado a mano: {trees} (sin pasada de prueba)")
+        else:
+            probe = fit(schema, pd.concat([hist_tr, hist_va, hist_te, live_tr, *extra_tr], ignore_index=True), live_va,
+                        args.cold_share, args.live_weight, threads=args.threads, ips_clip=args.ips_clip,
+                        org_weight=args.org_weight or 1.0)
+            trees = max(int(probe.info["trees"] * 1.05), 50)
+            print(f"parada temprana (validación: últimas horas en vivo): {probe.info['trees']} árboles → final {trees}")
+            print(metrics.show(probe.info["metrics"]))
         bird = fit(schema, pd.concat([hist_tr, hist_va, hist_te, live, *extra_all], ignore_index=True), live_va,
                    args.cold_share, args.live_weight, iterations=trees, threads=args.threads, ips_clip=args.ips_clip,
                    org_weight=args.org_weight or 1.0)
@@ -320,6 +324,7 @@ def main() -> None:
     t.add_argument("--name", required=True, help="carpeta del modelo en data/bird/")
     t.add_argument("--schema", default="v5", choices=sorted(SCHEMAS))
     t.add_argument("--final", action="store_true", help="modelo de producción: histórico + vivo")
+    t.add_argument("--trees", type=int, default=0, help="con --final: nº de árboles fijo, sin parada temprana")
     t.add_argument("--ips-clip", type=float, default=0.0,
                    help="pesar el histórico por 1/propensity acotado a este valor (0 = no)")
     t.add_argument("--org-weight", type=float, default=0.0,
