@@ -42,7 +42,11 @@ y se añade a esta tabla y a `BIRD_VERSIONS` en `reco/policies/__init__.py`.
 
 El nombre de versión funciona como política: `make dry POLICY=v3-bird`, `make up AB=<otros brazos>,v3-bird=v3-bird`.
 Código en `reco/bird/` y `reco/policies/bird.py`; entrenamiento y evaluación con `scripts/bird.py` y
-`scripts/bird_blend.py`. La siguiente versión será **v6-bird**.
+`scripts/bird_blend.py`. La siguiente versión será **v7-bird**.
+
+v6-bird (`bird_v5_delta`) es v5-bird con la historia de los usuarios al minuto: mismo modelo y mismas features,
+más un delta con lo ocurrido desde la última descarga completa, que se pide en cada refresco (`live5.Delta`).
+En un A/B `v5-bird` + `v6-bird` los dos brazos comparten la misma descarga en memoria (`_V5Hub`).
 
 ### Dataset v5 (v5-bird)
 - Features, justificación, medidas y fuentes: `docs/DATASET_V5.md`. Fórmulas en `reco/bird/feat5.py`: **una sola

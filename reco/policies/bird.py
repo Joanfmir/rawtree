@@ -121,12 +121,12 @@ class BirdV2(Policy):
             self._thread.start()
 
     def _refresh_background(self) -> None:
-        import subprocess
-        import sys
-        import time
+        self._refresh_sold()
+        self._reload_state()
 
+    def _refresh_sold(self) -> None:
         from ..client import query
-        from ..config import ROOT, TEAM
+        from ..config import TEAM
         try:   # lo que nuestro carrusel ya ha vendido en vivo
             rows = query(f"""SELECT DISTINCT r.user_id::String AS u, f.purchased::String AS p
                              FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r
@@ -138,6 +138,13 @@ class BirdV2(Policy):
             self._sold = {u: frozenset(p) for u, p in sold.items()}
         except Exception as e:
             print(f"[{self.name}] ventas en vivo no actualizadas: {e}")
+
+    def _reload_state(self) -> None:
+        import subprocess
+        import sys
+        import time
+
+        from ..config import ROOT
         if time.monotonic() - self._state_at >= self.STATE_EVERY:
             self._state_at = time.monotonic()
             try:
@@ -199,29 +206,98 @@ class BirdV5(BirdV2):
     model_name = "v5_fresh"   # solo histórico anterior al 07/11: el que se evalúa offline
     final_name = "v5_live"    # histórico + feedback en vivo: el que se sirve
     state_script = "bird_v5.py"
+    use_delta = False         # v6-bird (BirdV5Delta) lo activa
+    _hub = None               # estado en memoria compartido por todos los brazos v5 del proceso
 
     def _load_state(self, until):
         from ..bird.live5 import LiveState5
-        return LiveState5.load(until)
+        if until:                       # evaluación offline: estado propio, a fecha del corte
+            return LiveState5.load(until)
+        if BirdV5._hub is None:
+            BirdV5._hub = _V5Hub(LiveState5.load(None), self.STATE_EVERY, self.state_script)
+        return BirdV5._hub.pick(self.use_delta)
 
     def _refresh_background(self) -> None:
+        self._refresh_sold()
+        hub = BirdV5._hub
+        hub.refresh(self.name)
+        self.live = hub.pick(self.use_delta)   # cambio atómico: recommend() usa el estado que cogió al empezar
+
+
+class BirdV5Delta(BirdV5):
+    """Política "bird_v5_delta" (v6-bird): v5-bird con la historia de los usuarios al minuto.
+
+    Mismo modelo y mismas features. Lo único que cambia: además de la descarga completa de cada 30 min,
+    en cada refresco (2 min) se suma lo que cada usuario ha hecho desde entonces (reco/bird/live5.Delta), y
+    lo que haya comprado en ese rato deja de ofrecérsele. Sirve sobre todo cuando entran compradores nuevos
+    de golpe: hasta la siguiente descarga completa solo existen en el delta.
+    En un A/B con v5-bird los dos brazos comparten la misma descarga: la diferencia es solo el delta.
+    """
+    name = "bird_v5_delta"
+    use_delta = True
+
+
+class _V5Hub:
+    """Estado de servicio de v5 compartido entre brazos: una sola descarga, una sola copia en memoria.
+
+    plain   la descarga completa con catálogo, promociones y popularidad al día (lo que sirve v5-bird)
+    delta   lo mismo + lo que han hecho los usuarios desde la descarga (lo que sirve v6-bird)
+    Cada brazo llama a refresh() a su ritmo; si otro lo acaba de hacer (o lo está haciendo), no se repite.
+    """
+
+    def __init__(self, base, state_every: float, script: str) -> None:
+        import threading
         import time
-        super()._refresh_background()
+        self.lock = threading.Lock()
+        self.base = self.plain = self.delta = base
+        self.state_every, self.script = state_every, script
+        self.state_at, self.items_at = time.monotonic(), 0.0
+
+    def pick(self, use_delta: bool):
+        return self.delta if use_delta else self.plain
+
+    def refresh(self, who: str) -> None:
+        import subprocess
+        import sys
+        import time
+
+        from ..bird.live5 import LiveState5
+        from ..config import ROOT
+        if not self.lock.acquire(blocking=False):
+            return
         try:
-            t = time.time()
-            self.live = self.live.with_items()   # cambio atómico: recommend() usa el estado que cogió al empezar
-            if time.time() - t > 20:
-                print(f"[{self.name}] refresco de producto lento: {time.time() - t:.0f}s")
-        except Exception as e:
-            print(f"[{self.name}] refresco de producto falló, sigo con el anterior: {e}")
-        try:   # lo que han hecho los usuarios desde la última descarga completa (segunda capa del estado)
-            live = self.live.with_delta()
-            self.live = live
-            d = live.delta
-            if d is not None and d.seconds > 20:
-                print(f"[{self.name}] delta de usuarios lento: {d.seconds:.0f}s ({d.events:,} eventos desde {d.t0})")
-        except Exception as e:
-            print(f"[{self.name}] delta de usuarios falló, sigo con el anterior: {e}")
+            if time.monotonic() - self.items_at < 60:
+                return
+            self.items_at = time.monotonic()
+            base = self.base
+            if time.monotonic() - self.state_at >= self.state_every:
+                self.state_at = time.monotonic()
+                try:
+                    t = time.time()
+                    subprocess.run([sys.executable, str(ROOT / "scripts" / self.script), "state"], cwd=ROOT,
+                                   check=True, capture_output=True, timeout=1500)
+                    base = LiveState5.load(None)
+                    print(f"[{who}] estado de usuarios recargado en {time.time() - t:.0f}s (corte {base.t0})")
+                except Exception as e:
+                    print(f"[{who}] recarga del estado falló, sigo con el anterior: {e}")
+            try:
+                t = time.time()
+                base = base.with_items()
+                if time.time() - t > 20:
+                    print(f"[{who}] refresco de producto lento: {time.time() - t:.0f}s")
+            except Exception as e:
+                print(f"[{who}] refresco de producto falló, sigo con el anterior: {e}")
+            try:   # segunda capa: lo ocurrido desde el corte de la descarga
+                delta = base.with_delta()
+                d = delta.delta
+                if d is not None and d.seconds > 20:
+                    print(f"[{who}] delta de usuarios lento: {d.seconds:.0f}s ({d.events:,} eventos desde {d.t0})")
+            except Exception as e:
+                print(f"[{who}] delta de usuarios falló; este refresco v6-bird va sin delta: {e}")
+                delta = base
+            self.base, self.plain, self.delta = base, base, delta
+        finally:
+            self.lock.release()
 
 
 class BirdRank(BirdV2):
