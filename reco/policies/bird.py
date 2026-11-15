@@ -237,6 +237,18 @@ class BirdV5Delta(BirdV5):
     use_delta = True
 
 
+class BirdV5DeltaFresh(BirdV5Delta):
+    """Política "bird_v5_delta_fresh" (v8-bird): v6-bird con el modelo reentrenado con el vivo al día.
+
+    Mismo código de servicio, mismas 81 features y mismo procedimiento de entrenamiento que v5_live (sin
+    recompra, cold start simulado, vivo × 3). Lo único que cambia son los datos: v5_live vio nuestro carrusel
+    hasta el 14/11 a las 22:30 UTC; v5_live2, hasta la madrugada del 15/11 (scripts/bird_v5_lowmem.py).
+    En un A/B con v6-bird los dos brazos comparten estado y delta: la diferencia es solo el modelo.
+    """
+    name = "bird_v5_delta_fresh"
+    final_name = "v5_live2"
+
+
 class _V5Hub:
     """Estado de servicio de v5 compartido entre brazos: una sola descarga, una sola copia en memoria.
 

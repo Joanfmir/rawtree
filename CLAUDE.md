@@ -39,10 +39,12 @@ y se añade a esta tabla y a `BIRD_VERSIONS` en `reco/policies/__init__.py`.
 | v3-bird | `bird_blend_rank` | `personal_v5` propone 50 candidatos y el modelo de ranking (YetiRank) los ordena |
 | v4-bird | `bird_two_stage` | Doble modelo sin heurística: el clasificador de v2-bird elige 50 candidatos y un ranking con features de lista (dataset v3) los ordena |
 | v5-bird | `bird_v5` | El modelo de v2-bird (sin recompra) con el dataset v5: 81 features invariantes al volumen de tráfico + promociones, tendencias, feedback propio y contexto; entrenado con histórico + feedback en vivo |
+| v6-bird | `bird_v5_delta` | v5-bird con la historia de los usuarios al minuto (delta): mismo modelo y mismas features |
+| v8-bird | `bird_v5_delta_fresh` | v6-bird con el modelo reentrenado con el vivo al día (`v5_live2`): mismo código, mismas features y mismo procedimiento; solo cambian los datos |
 
 El nombre de versión funciona como política: `make dry POLICY=v3-bird`, `make up AB=<otros brazos>,v3-bird=v3-bird`.
 Código en `reco/bird/` y `reco/policies/bird.py`; entrenamiento y evaluación con `scripts/bird.py` y
-`scripts/bird_blend.py`. La siguiente versión será **v7-bird**.
+`scripts/bird_blend.py`. La siguiente versión será **v9-bird** (v7-bird está reservado en la rama `v7-bird`: features de la última hora y fatiga).
 
 v6-bird (`bird_v5_delta`) es v5-bird con la historia de los usuarios al minuto: mismo modelo y mismas features,
 más un delta con lo ocurrido desde la última descarga completa, que se pide en cada refresco (`live5.Delta`).
@@ -55,6 +57,8 @@ En un A/B `v5-bird` + `v6-bird` los dos brazos comparten la misma descarga en me
 - `python scripts/bird_v5.py dataset [--refresh-live]` · `compare` (v2 frente a v5 con las mismas filas) ·
   `train --name v5_fresh` (solo histórico < 07/11, para `make offline`) · `train --name v5_live --final`
   (producción: histórico + vivo) · `offline` (los dos tests solo para `bird_v2` y `bird_v5`) · `state` · `parity`.
+- Reentrenar con el vivo al día en una máquina con poca memoria: `python scripts/bird_v5_lowmem.py live` (vuelve a
+  bajar solo la parte en vivo, por lotes) y `train --name v5_live2` (mismo procedimiento que `train --final`).
 - Antes de servir `v5-bird`: `python scripts/bird_v5.py state` (descarga `data/bird/state5_live/`, ~2 min).
 - Ninguna feature de v5 puede ser un recuento absoluto: el vivo tiene ~29 veces más eventos por hora que el
   histórico. Cuotas, cocientes o lifts suavizados (`tests/test_bird_v5.py` lo comprueba).
