@@ -93,9 +93,20 @@ def paired_ndcg(te: pd.DataFrame, a: np.ndarray, b: np.ndarray, target: str, n: 
 
 
 def fit(schema, tr: pd.DataFrame, va: pd.DataFrame, cold: float, live_weight: float, iterations: int | None = None,
-        threads: int = 6, ips_clip: float = 0.0) -> BirdModel:
+        threads: int = 6, ips_clip: float = 0.0, click_weight: float = 0.0, click_sources: tuple[str, ...] = ("hist", "live"),
+        stop: str = "Logloss") -> BirdModel:
+    """click_weight > 0: un clic sin compra cuenta como acierto parcial. La fila se desdobla en dos:
+    una con target 1 y peso click_weight, otra con target 0 y peso 1 − click_weight (la etiqueta media es
+    click_weight). Hay ~3 veces más clics que compras: más ejemplos de lo que le interesa al usuario.
+    stop: métrica de la parada temprana. "AUC" no depende del nivel de las probabilidades; hace falta con
+    click_weight, porque al subir la tasa de aciertos Logloss sobre compras empeora aunque el orden mejore."""
     from reco.bird.build_v5 import simulate_cold
     tr = simulate_cold(tr, cold)
+    if click_weight > 0:
+        soft = ((tr.target_click == 1) & (tr.target_purchase == 0) & tr.source.isin(click_sources)).to_numpy()
+        pos = tr[soft].assign(target_purchase=1, sample_weight=tr.sample_weight[soft] * click_weight)
+        tr = tr.assign(sample_weight=np.where(soft, tr.sample_weight * (1 - click_weight), tr.sample_weight))
+        tr = pd.concat([tr, pos], ignore_index=True)
     if live_weight != 1.0:
         tr = tr.assign(sample_weight=tr.sample_weight * np.where(tr.source == "live", live_weight, 1.0))
     if ips_clip > 0:
@@ -106,8 +117,59 @@ def fit(schema, tr: pd.DataFrame, va: pd.DataFrame, cold: float, live_weight: fl
         w = np.clip(1.0 / np.clip(tr.propensity.to_numpy(dtype=float), 1e-3, None), None, ips_clip)
         w = np.where(hist, w / w[hist].mean(), 1.0)
         tr = tr.assign(sample_weight=tr.sample_weight * w)
-    params = {**PARAMS, "thread_count": threads, **({"iterations": iterations} if iterations else {})}
+    params = {**PARAMS, "thread_count": threads, **({"iterations": iterations} if iterations else {}),
+              **({"eval_metric": stop} if stop != "Logloss" else {})}
     return train(tr, va, schema, params=params, early_stopping=None if iterations else 50)
+
+
+def parse_variant(spec: str) -> dict:
+    """'cw=0.3,stop=AUC,lw=10' → argumentos de fit(). cw = peso del clic, lw = peso del vivo,
+    stop = métrica de parada, cs = fuentes donde cuenta el clic (hist+live | live)."""
+    out = {}
+    for part in filter(None, spec.split(",")):
+        k, _, v = part.partition("=")
+        if k == "cw":
+            out["click_weight"] = float(v)
+        elif k == "lw":
+            out["live_weight"] = float(v)
+        elif k == "stop":
+            out["stop"] = v
+        elif k == "cs":
+            out["click_sources"] = tuple(v.split("+"))
+        else:
+            raise SystemExit(f"variante desconocida: {part}")
+    return out
+
+
+def cmd_compare_train(args) -> None:
+    """Mismas filas, mismas features y mismo test; lo único que cambia es CÓMO se entrena (variantes).
+    Entrena con histórico + vivo(primeras horas), para con validación en vivo y mide en las últimas horas de
+    nuestro carrusel (que ninguna variante ha visto): puesto del producto comprado entre los 10 enseñados.
+    La primera variante es la referencia."""
+    hist = pd.concat([no_rebuy(load(n)) for n in ("train", "validation", "test")], ignore_index=True)
+    live_tr, live_va, live_te = live_split(no_rebuy(load("live")), args.valid_share, args.test_share)
+    print(f"live  train {dataset.describe(live_tr, V5)}\n      valid {dataset.describe(live_va, V5)}\n"
+          f"      test  {dataset.describe(live_te, V5)}")
+    base_tr = pd.concat([hist, live_tr], ignore_index=True)
+    te1 = live_te.assign(position=V5.reference_position)
+    scores, rows = {}, []
+    for spec in args.variants:
+        t = time.time()
+        kw = {"live_weight": args.live_weight, **parse_variant(spec)}
+        m = fit(V5, base_tr, live_va, args.cold_share, kw.pop("live_weight"), threads=args.threads, **kw)
+        scores[spec] = m.predict(te1)
+        print(f"  {spec or 'actual':<24} {m.info['trees']} árboles  {time.time() - t:.0f}s", flush=True)
+        for target in ("target_purchase", "target_click"):
+            rows.append({"objetivo": target.split("_")[1], "variante": spec or "actual", "árboles": m.info["trees"],
+                         **rank_report(live_te, scores[spec], target)})
+    print("\n" + pd.DataFrame(rows).set_index(["objetivo", "variante"]).sort_index().round(4).to_string())
+    ref = args.variants[0]
+    print(f"\nΔNDCG frente a «{ref or 'actual'}» (IC 95 % por bootstrap de usuarios):")
+    for spec in args.variants[1:]:
+        for target in ("target_purchase", "target_click"):
+            d, lo, hi = paired_ndcg(live_te, scores[ref], scores[spec], target)
+            verdict = "MEJOR" if lo > 0 else "PEOR" if hi < 0 else "empate"
+            print(f"  {spec:<24} {target.split('_')[1]:<9} {d:+.4f}  [{lo:+.4f}, {hi:+.4f}]  {verdict}")
 
 
 def cmd_compare(args) -> None:
@@ -170,14 +232,16 @@ def cmd_train(args) -> None:
         # las últimas horas del vivo como validación, escalado a los datos de más.
         live = no_rebuy(load("live"))
         live_tr, live_va = dataset.split_by_time(live, args.valid_share)
+        kw = {"live_weight": args.live_weight, **parse_variant(args.variant)}
+        lw = kw.pop("live_weight")
         probe = fit(schema, pd.concat([hist_tr, hist_va, hist_te, live_tr], ignore_index=True), live_va,
-                    args.cold_share, args.live_weight, threads=args.threads, ips_clip=args.ips_clip)
+                    args.cold_share, lw, threads=args.threads, ips_clip=args.ips_clip, **kw)
         trees = max(int(probe.info["trees"] * 1.05), 50)
         print(f"parada temprana (validación: últimas horas en vivo): {probe.info['trees']} árboles → final {trees}")
         print(metrics.show(probe.info["metrics"]))
         bird = fit(schema, pd.concat([hist_tr, hist_va, hist_te, live], ignore_index=True), live_va,
-                   args.cold_share, args.live_weight, iterations=trees, threads=args.threads, ips_clip=args.ips_clip)
-        bird.info["all_data"] = True
+                   args.cold_share, lw, iterations=trees, threads=args.threads, ips_clip=args.ips_clip, **kw)
+        bird.info["all_data"], bird.info["variant"] = True, args.variant
     else:
         # evaluación offline (make offline): solo datos anteriores al 07/11, como v2_fresh
         bird = fit(schema, hist_tr, hist_va, args.cold_share, 1.0, threads=args.threads, ips_clip=args.ips_clip)
@@ -253,8 +317,13 @@ def main() -> None:
     t.add_argument("--final", action="store_true", help="modelo de producción: histórico + vivo")
     t.add_argument("--ips-clip", type=float, default=0.0,
                    help="pesar el histórico por 1/propensity acotado a este valor (0 = no)")
+    t.add_argument("--variant", default="", help="cómo entrenar, p. ej. 'cw=0.3,stop=AUC' (ver compare-train)")
     t.set_defaults(fn=cmd_train)
-    for p in (c, t):
+    ct = sub.add_parser("compare-train", help="mismas filas y features, distintas formas de entrenar")
+    ct.add_argument("--variants", nargs="+", default=["", "stop=AUC", "cw=0.2,stop=AUC", "cw=0.5,stop=AUC"],
+                    help="la primera es la referencia ('' = como se entrena ahora)")
+    ct.set_defaults(fn=cmd_compare_train)
+    for p in (c, t, ct):
         p.add_argument("--cold-share", type=float, default=0.3)
         p.add_argument("--live-weight", type=float, default=3.0, help="peso de las filas en vivo frente a las del histórico")
         p.add_argument("--valid-share", type=float, default=0.15)
