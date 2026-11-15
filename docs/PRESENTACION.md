@@ -4,8 +4,8 @@ Seis minutos más preguntas. Los sponsors han pedido **el cómo y el porqué, no
 cosa, cómo entrenamos, qué agentes de código usamos y qué hizo cada persona. Por eso el guion va por decisiones
 y no por componentes. Cada bloque sigue el mismo patrón: **qué vimos → qué decidimos → qué pasó**.
 
-Antes de presentar hay que rellenar los tres PENDIENTE: resultado final, reparto del equipo y qué era la
-versión `mj`.
+Antes de presentar hay que rellenar los PENDIENTE: resultado final, qué era la versión `mj` y quién usó cada
+agente.
 
 | Criterio del jurado | Puntos | Dónde se responde |
 |---|---|---|
@@ -136,14 +136,12 @@ Avisar de que son horas distintas y no comparables una a una; las decisiones se 
 - **Qué nos quedamos nosotros:** qué hipótesis probar, leer los A/B con su margen de error y cada cambio de
   producción.
 
-**Quién hizo qué. PENDIENTE: una línea por persona.**
+**Quién hizo qué.** Dos subequipos; el reparto es aproximado porque nos fuimos ayudando.
 
-| Persona | Qué hizo |
-|---|---|
-| PENDIENTE | |
-| PENDIENTE | |
-| PENDIENTE | |
-| PENDIENTE | |
+| Subequipo | Personas | En qué se centró |
+|---|---|---|
+| Algoritmos | Lucas y Joan | Políticas y modelos de recomendación, servicio y A/B |
+| Dataset | Santi y Jordi | Exploración de datos, features y datasets de entrenamiento |
 
 ## 7 · Demo (5:30–6:00)
 
@@ -151,7 +149,7 @@ Una sola cosa en pantalla: **el A/B es una consulta**. Ejecutar `make monitor`, 
 `team_17.submissions` (qué versión respondió) con `team_17.feedback` (qué pasó) y enseña conversión, respuestas
 a tiempo y latencia por versión. Con eso se ve RawTree, el feedback y cómo decidimos, todo a la vez.
 
-Plan B si no hay red: la tabla del bloque 5 y el diagrama del `README.md`.
+Plan B si no hay red: la tabla del bloque 5.
 
 No arrancar ningún servicio durante la demo.
 

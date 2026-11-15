@@ -91,27 +91,6 @@ v5, v6 and v7 are indistinguishable; v8 was last in every hour and was left out 
 
 ## How the system works
 
-```mermaid
-flowchart LR
-    subgraph RawTree
-      RQ[shop.requests]
-      EV[shop.events + history]
-      CA[shop.catalog + catalog_updates]
-      FB[team_17.feedback]
-      SUB[team_17.submissions]
-    end
-    EV & CA & FB -->|SQL aggregates| ST[State in memory<br/>items · users · session neighbours]
-    RQ --> SV[serve loop]
-    SV -->|crc32 of request_id| AB{A/B arm}
-    AB --> M[CatBoost: P purchase<br/>81 features × whole catalogue]
-    ST --> M
-    M --> FZ[finalize<br/>10 distinct, active, in stock]
-    FZ --> SUB
-    SUB -.simulator.-> FB
-    FB -->|training rows, weight ×3| TR[retrain]
-    TR --> M
-```
-
 1. **Read.** The serve loop polls `shop.requests` in batches.
 2. **Score.** For each request the model scores every in-stock product the user has not bought:
    P(purchase | user, session, context, product). There is no candidate generator in the final version: the
@@ -191,14 +170,12 @@ Most of the code was written with coding agents, with us deciding what to try an
 
 ## Team
 
-TODO: one line per person (the sponsors ask for this explicitly).
+Two sub-teams. The split is approximate: we helped each other throughout.
 
-| Member | What they did |
-|---|---|
-| TODO | |
-| TODO | |
-| TODO | |
-| TODO | |
+| Sub-team | Members | Focus |
+|---|---|---|
+| Algorithms | Lucas, Joan | Recommendation policies and models, serving and A/B testing |
+| Dataset | Santi, Jordi | Data exploration, features and training datasets |
 
 ## Run it
 
