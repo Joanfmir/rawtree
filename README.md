@@ -1,257 +1,231 @@
-# RawTree Challenge · Real-Time Recommendation
+# DreamTeam (team_17) · Real-time recommender for the RawTree Challenge
 
-**Datathon FME 2026 · 14–15 November 2026 · UPC Barcelona** · [Challenge page](https://datathon.rawtree.dev) · [Leaderboard](https://datathon.rawtree.dev/leaderboard)
+**Datathon FME 2026 · 14–15 November 2026 · UPC Barcelona**
 
-> Shoppers arrive at an online store every few seconds. For each one you have **3 seconds** to choose the **10 products** they will see. A hidden model simulates each shopper's decision to click and buy. Practise against the live stream on Saturday with a public leaderboard; from **Sunday 10:00 to 12:00 CET (UTC+1)** the stream switches to data nobody has seen and the leaderboard goes dark. At 12:00 the final ranking appears on its own.
+A shopper arrives every ~0.3 s. For each one we have 3 seconds to pick the 10 products they will see. This repo
+is the system we ran for 26 hours against the live stream: a CatBoost purchase model with 81 features computed
+in RawTree SQL, served from memory, retrained with our own live feedback, and chosen through simultaneous A/B
+tests.
+
+- Challenge statement (organisers' original README): [`ENUNCIADO.md`](ENUNCIADO.md)
+- Demo script: [`docs/PRESENTACION.md`](docs/PRESENTACION.md)
+- The 81 features, one by one, with the measurement that justifies each: [`docs/DATASET_V5.md`](docs/DATASET_V5.md)
+
+> **Result.** Final round (Sunday 10:00–12:00 CET): **TODO: position and score once published.**
+> Last three hours of practice: 5th–6th of 42 teams, 2.13 expected purchases per 100 requests (teams serving
+> only the baseline: ≈ 0.5).
 
 ---
 
-## The story
+## Why it looks like this: five decisions
 
-An online store sells around 5,000 products in ten categories. On the home page and on every product page there is a row of ten recommended products. Right now that row just shows the **all-time best sellers**. You have to build something that sells more, and it will be tested live, on shoppers arriving in real time.
+Each of these changed the system. They are in the order we made them.
 
-## What you build
+### 1. Stop recommending what the shopper already bought
 
-A system that, on its own and without anyone pressing buttons:
+**What we saw.** In the 60-day history, 62 % of purchases repeat a product the user had already bought, and an
+already-bought product is 6.5× more likely to be bought again. Our first personalised policy exploited that
+and won every offline metric.
 
-1. **Reads recommendation requests** from a RawTree table as they arrive. Each request describes a shopper and what they have just done in this session.
-2. **Within 3 seconds, writes back an ordered list of 10 product IDs** for that request.
-3. **Learns** from the feedback it receives (what was clicked and bought) and from the shared stream of store activity.
+**What happened live.** The opposite. In our own feedback, an already-bought product converted about 9× *less*
+(the challenge statement hints at it: "a shopper who already bought a product tends not to want it again").
 
-```
-             ┌──────────────────────────────┐
-             │  Shopper simulator (hidden)  │
-             └──────┬────────────────▲──────┘
-  shop.requests     │                │ reads your answers,
-  shop.events       │                │ decides clicks & purchases
-  shop.catalog_...  ▼                │
-             ┌─────────────┐   ┌─────┴──────────────────┐
-             │ Your system │──▶│ team_NN.submissions    │
-             └──────▲──────┘   └────────────────────────┘
-                    │          ┌────────────────────────┐
-                    └──────────│ team_NN.feedback       │ only your team can read it
-                               └────────────────────────┘
-```
+**What we did.** Every policy from `v2-bird` on never proposes a product the user has bought, and the offline
+tests exclude repurchases.
 
-## Data
+### 2. Do not trust an offline metric until it has been checked against the leaderboard
 
-All data lives in **RawTree**. Each team gets one API key that can **read** the shared `shop` database and **read and write** its own database `team_NN`.
+**What we saw.** After decision 1 we no longer knew which offline number to believe. So we took the 8 versions
+we had already served, with their real conversion on the leaderboard, and asked each offline test to rank them.
 
-### Available from the start
-
-**`shop.catalog`**: the product catalogue, around 5,000 products.
-
-| Field | Type | Notes |
+| Offline test · metric | Spearman vs leaderboard | Pairs ordered correctly |
 |---|---|---|
-| `product_id` | string | Opaque ID |
-| `category` | string | Top-level category (10 values) |
-| `subcategory` | string | 90 values |
-| `brand` | string | |
-| `price_eur` | number | Price at the start. Price changes arrive in `shop.catalog_updates` |
-| `description` | string | One or two sentences of product text |
-| `created_at` | timestamp | |
-| `is_active` | bool | |
+| **organic · `ndcg@10`** | **0.98** | **27 / 28** |
+| history · `ips_ndcg` (no repurchases) | 0.95 | 26 / 28 |
+| history · `ips_ndcg` with repurchases | −0.14 | 12 / 28 |
+| history · `hit@10` with repurchases | −0.60 | 8 / 28 |
 
-**`shop.history_sessions`**: 60 days of past carousel impressions (≈2 million records), served by the old system.
+**What we did.** The reference test became **organic**: real requests from the live stream, and the target is
+what that user went on to buy *on their own* (`shop.events`) in the next 30 minutes. `make offline C="<policy>"`
+runs it, recomputes this reliability table, and returns a verdict for the candidate (worse → drop · tie → only
+live can tell · better → A/B). The metric we had started with would have ranked our versions backwards.
 
-| Field | Type | Notes |
+### 3. Features must mean the same thing in the history and in the stream
+
+**What we saw.** The live stream has ~29× more events per hour than the history. A feature like "purchases in
+the last 7 days" means something different when training than when serving. We measured the drift of each
+feature (how well that feature alone tells a history row from a live row): the 12 worst averaged 0.44.
+
+**What we did.** Dataset v5: no absolute counts, only shares, ratios and smoothed lifts (average drift 0.12), with a
+unit test that enforces it. The same audit showed things the history cannot teach at all (it has no price changes;
+live has 2-hour promotions with +42 % conversion in our carousel; 100 new products arrive every 4 hours and sell
+from the first minute), so those features are learned from live rows only. Training and serving share **one**
+implementation of every formula (`reco/bird/feat5.py`), and a parity check compares both paths value by value.
+
+### 4. Our own feedback is the only direct measurement of the simulator
+
+**What we did.** Live rows (`team_17.feedback` × `shop.requests`) go into the training set with 3× weight, and
+two features are computed from them: clicks and purchases of each product in *our* carousel, normalised by the
+position it was shown in. We retrained as feedback accumulated: `v5-bird` (Saturday night) → `v7-bird` (same
+model, more live data) → the final-round model, retrained with feedback up to Sunday 10:00 CET.
+
+### 5. A version goes to production only if it wins a simultaneous A/B
+
+**Why.** Trends and stock change during the day, so comparing a version from 15:00 with one from 18:00 says
+nothing. Requests are split across arms by `crc32(request_id)`, each arm writes its own `model_version`, and we
+compare them over the same window with standard errors.
+
+**The idea it killed.** `v8-bird` added organic purchases to the training set. Offline it tied; its own note said
+"do not take it to the final round without winning an A/B". Over three hours with four arms on equal traffic:
+
+| Version | Requests | Purchases per 100 requests |
 |---|---|---|
-| `request_id` | string | |
-| `ts` | timestamp | |
-| `user_id` | string | Opaque ID |
-| `context` | object | `device` (web, ios, android), `region`, `page` (home, product, category) |
-| `recent_views` | array | Products viewed earlier in the session, with timestamps |
-| `shown` | array | The 10 products the old system showed, in order |
-| `propensity` | array | Probability the old system had of showing each of those products in that slot, given the products in the slots above it |
-| `clicked` | string or null | Product clicked, if any |
-| `purchased` | string or null | Product bought, if any |
-| `revenue_eur` | number | |
+| v7-bird | 7,764 | 2.29 ± 0.17 |
+| v5-bird | 7,883 | 2.21 ± 0.17 |
+| v6-bird | 7,724 | 2.20 ± 0.17 |
+| v8-bird | 7,866 | 1.92 ± 0.15 |
 
-The old system is a "best sellers plus a bit of randomness" carousel, so this log is **biased towards popular products**. The `propensity` column lets you correct for that bias, if you want to.
+v5, v6 and v7 are indistinguishable; v8 was last in every hour and was left out of the final round.
 
-**`shop.history_events`**: 60 days of organic store activity that did **not** come from the carousel (`view`, `add_to_cart`, `purchase`), ≈12 million records. Useful to learn what users like beyond what the old system showed them.
+---
 
-| Field | Type | Notes |
-|---|---|---|
-| `ts` | timestamp | |
-| `event_type` | string | `view`, `add_to_cart`, `purchase` |
-| `user_id`, `session_id` | string | |
-| `product_id` | string | |
-| `price_eur` | number | Price at the time of the event |
-| `device`, `region` | string | |
+## How the system works
 
-### During the event (Saturday to Sunday)
-
-**`shop.requests`** (append-only): one record per shopper arriving at the carousel, about **3 per second**, day and night.
-
-```json
-{
-  "request_id": "r_01JD8K3...",
-  "ts": "2026-11-14T16:02:11.482Z",
-  "user_id": "u_7f21c9",
-  "is_new_user": false,
-  "context": {"device": "ios", "region": "Catalunya", "page": "product"},
-  "recent_views": [
-    {"product_id": "p_5a1e", "ts": "2026-11-14T16:01:40Z"},
-    {"product_id": "p_0b9d", "ts": "2026-11-14T16:01:58Z"}
-  ]
-}
+```mermaid
+flowchart LR
+    subgraph RawTree
+      RQ[shop.requests]
+      EV[shop.events + history]
+      CA[shop.catalog + catalog_updates]
+      FB[team_17.feedback]
+      SUB[team_17.submissions]
+    end
+    EV & CA & FB -->|SQL aggregates| ST[State in memory<br/>items · users · session neighbours]
+    RQ --> SV[serve loop]
+    SV -->|crc32 of request_id| AB{A/B arm}
+    AB --> M[CatBoost: P purchase<br/>81 features × whole catalogue]
+    ST --> M
+    M --> FZ[finalize<br/>10 distinct, active, in stock]
+    FZ --> SUB
+    SUB -.simulator.-> FB
+    FB -->|training rows, weight ×3| TR[retrain]
+    TR --> M
 ```
 
-**`shop.events`** (append-only): organic store activity in real time, same format as `shop.history_events`. This is where you can spot trends as they happen.
+1. **Read.** The serve loop polls `shop.requests` in batches.
+2. **Score.** For each request the model scores every in-stock product the user has not bought:
+   P(purchase | user, session, context, product). There is no candidate generator in the final version: the
+   whole catalogue is scored from memory. End to end (polling included) the median answer takes ~1.6 s and the
+   95th percentile ~2.4 s of the 3 s allowed.
+3. **Guard.** `finalize()` guarantees 10 distinct, active, in-stock IDs. No answer leaves without passing through it.
+4. **Write.** The list goes to `team_17.submissions` with the arm's `model_version`.
+5. **Learn.** State is refreshed from the stream in the background (popularity and trends in 10-minute steps, a
+   per-user delta of what happened since the last full download, catalogue and stock). The model itself is
+   retrained by hand with the new feedback; switching arms is a team decision, not an automatic bandit.
 
-**`shop.catalog_updates`** (append-only): one record per change, with the full product after the change plus `ts` and `change` (`new_product`, `price_change`, `out_of_stock`, `back_in_stock`). The current catalogue is `shop.catalog` with the latest update of each product applied on top.
+Heavy work never happens inside `recommend()`: it goes into SQL, `fit()` or `refresh()`.
 
-**`team_NN.feedback`** (only your team can read it): what happened with each of your recommendations, written a few seconds after the deadline.
+## How the model is trained
 
-```json
-{
-  "request_id": "r_01JD8K3...",
-  "ts": "2026-11-14T16:02:16.900Z",
-  "shown": ["p_91aa", "p_5a1e", "..."],
-  "served_by": "team",
-  "fallback_reason": "",
-  "latency_ms": 840,
-  "clicked": "p_91aa",
-  "purchased": "p_91aa",
-  "revenue_eur": 34.99
-}
-```
-
-`served_by` is `team` if your answer arrived on time and was valid, and `fallback` if not; in that case the shopper saw the baseline (the all-time best sellers that are in stock) and `fallback_reason` says why (`missing`, `late` or `invalid`). `clicked` and `purchased` are `""` when nothing happened. The first record of the table (`request_id = "__init__"`) is a placeholder: ignore it.
-
-**`team_NN.scratch`**: an empty table for whatever you want to store in RawTree (features, embeddings, model outputs). No schema needed: insert JSON.
-
-## What you submit
-
-Insert **one record per request** into **`team_NN.submissions`**:
-
-```json
-{
-  "request_id": "r_01JD8K3...",
-  "items": ["p_91aa", "p_5a1e", "p_c302", "p_77d0", "p_0e12",
-            "p_a4b8", "p_19f3", "p_6d2c", "p_e801", "p_3b5a"],
-  "model_version": "v3-mf-bandit"
-}
-```
-
-Rules:
-
-- **Exactly 10 distinct, active product IDs.** Invalid answers are replaced by the fallback.
-- The answer must reach RawTree **within 3 seconds of the request `ts`**, as measured by the organisers' clock (polled every half second). Late answers are replaced by the fallback.
-- If you send several answers for the same request, only one counts: send one.
-- **Batch your inserts** (for example, every half second) instead of one HTTP call per request. For reference, the starter baseline polls every 0.3 s and answers in about 1 s (95% within 1.5 s) from the request `ts`: the rest of the 3 seconds is yours to compute.
-- Order matters: shoppers look at the first slots much more than at the last ones.
-
-## Timeline
-
-| When | What |
+| | |
 |---|---|
-| **Saturday, opening** | Data, keys and starter kit released |
-| **Saturday 10:00 → Sunday 10:00** | Practice round: live stream, **public leaderboard** updated every 10 minutes |
-| **Sunday 10:00 → 12:00** | **Final round**: the stream switches to **new data** (new shoppers, new products, new trends). The leaderboard is hidden |
-| **Sunday 12:00** | Submissions close. The stream stops and the **final ranking appears automatically** on the leaderboard page |
+| Model | CatBoost classifier, P(purchase) per impression |
+| History rows | `shop.history_sessions`: every carousel with a click + 1 in 25 without (weighted ×25). Train 26/09–30/10, validation 31/10–06/11, test 07/11–14/11 |
+| Live rows | Our own carousels from `team_17.feedback`: every one with a click + 1 in 10 without. Weight ×3 |
+| Repurchases | Impressions of products the user had already bought are removed |
+| Cold start | In 30 % of history requests the user's history is hidden, so the model learns to decide from session and context alone |
+| Features | 81: product (catalogue, price, promotion, organic popularity, trend), response in the carousel, context (device, region, page), session (`recent_views` vs candidate), user, user × candidate affinity |
+| Validation | Temporal split for model selection; the organic test and a live A/B before production |
 
-All times are Barcelona time (CET, UTC+1); the data timestamps are UTC.
+Commands: `python scripts/bird_v5.py dataset --refresh-live` → `train --name v5_live2 --final` → `parity`.
+Trained models are in `data/bird/<name>/` (`model.cbm`, `schema.json`, `metrics.json`).
 
-There is no file to upload and nothing to do at 12:00. **Your system *is* your submission**: whatever it answers between 10:00 and 12:00 is what gets scored.
+### Version history
 
-During the final round nothing changes on your side: your system keeps reading requests and answering them, the requests are simply new. You keep receiving feedback, so you can estimate your own conversion, but you will not see anyone else's until 12:00. **Make sure your best version is running by 10:00.**
-
-**Status light.** During the final round the leaderboard shows only a green or red light per team: green if more than 90% of your answers in the last 5 minutes were valid and on time. It does not score anything; it is there so that if your system breaks at 10:05, you notice.
-
-**Shoppers keep arriving while you sleep.** A request that is not answered gets the fallback.
-
-Leaderboard: **https://datathon.rawtree.dev/leaderboard**
-
-## Evaluation
-
-### 70 points · Final round (automatic)
-
-Computed only on the requests of the final round (Sunday 10:00–12:00 CET). The practice round does not count.
-
-| Component | Points | Metric |
+| Version | What it is | Live result |
 |---|---|---|
-| Conversion | 50 | Expected purchases per 100 requests (see *No luck* below) |
-| Cold start | 10 | The same, restricted to **cold requests**: a new shopper (`is_new_user`), or `recent_views` that include a product added during the event (`new_product` in `shop.catalog_updates`) |
-| Reliability | 10 | Share of requests answered validly and on time |
+| `baseline` | All-time best sellers (starter kit) | 0.74 |
+| `Leattner.v1–v4` (`personal`) | Weighted signals: session, co-view neighbours, user affinities, context popularity | 1.04 → 1.45. First versions above the baseline |
+| `v1-bird` | CatBoost, 5 features | Not served: reference for the dataset contract |
+| `v2-bird` | CatBoost, 56 features, no repurchase, scores the whole catalogue | 1.62 (as `v2-bird-norebuy`) |
+| `v3-bird` | Heuristic proposes 50 candidates, a YetiRank model orders them | 1.53. Looked better than v2 on the history test and lost to it live: the case that made us switch to the organic test |
+| `v4-bird` | Two models: classifier selects 50, ranker with list features orders them | Not served live |
+| `v5-bird` | v2's model on dataset v5 (81 volume-invariant features, promotions, trends, own feedback) | ≈ 2.2. New production base |
+| `v6-bird` | v5 + per-user state up to the minute (delta) | Tie with v5 |
+| `v7-bird` | v6 retrained with more live feedback | Tie with v5 and v6. **Final-round model**: retrained with feedback up to 10:00 CET on Sunday and served alone from 10:24 CET (as `mj`; TODO: confirm) |
+| `v8-bird` | v7 + organic purchases in training | 1.92. Lost the A/B, discarded |
 
-Conversion and cold start are turned into a 0–100 score between two anchors the organisers compute on the same stream:
+Last column: realised purchases per 100 requests in our own feedback while that version was live. Versions that
+ran at different hours are not directly comparable; the decisions were taken on simultaneous A/B tests.
 
-```
-score = 100 × (team − baseline) / (oracle − baseline), clipped to [0, 100]
-```
+## How we used RawTree
 
-- **baseline** (0): the all-time best sellers that are in stock, ranked once at the start of the stream (the starter-kit recommender). It is also the fallback.
-- **oracle** (100): the best list possible, the 10 products the hidden model itself would pick for each shopper.
-- The leaderboard also shows a **reference**: a strong recommender built by the organisers, as a benchmark. **It can be beaten.**
+- **Features are SQL.** Popularity shares, shrunk rates, co-view neighbours, per-user affinities and
+  position-normalised feedback lifts are aggregated in RawTree; we download the result, not the events.
+- **Columns are `Dynamic`**, so joins and `argMax` need explicit casts (`product_id::String`,
+  `ts::DateTime64(3)`).
+- **Our key can only `SELECT` and insert JSON**, so nothing derived lives in RawTree: aggregates are cached
+  locally as Parquet and loaded into memory.
+- **The A/B is a query.** `team_17.submissions` (which arm answered) joined with `team_17.feedback` (what
+  happened) gives conversion per version; `scripts/monitor.py` and `scripts/ab.py` are that join.
+- **The public leaderboard API** (`/api/state?by=model`) gives the luck-free conversion of each `model_version`;
+  we use it as ground truth for the offline tests.
 
-Reliability is the percentage of requests answered validly and on time.
+## How we worked: coding agents
 
-**On the leaderboard** the 70 points are normalised to a score out of 100 (about 71 conversion, 14 cold start, 14 reliability). Your final grade is 70 % of that score plus the jury's 30 points.
+Most of the code was written with coding agents, with us deciding what to try and what to believe.
 
-**No luck.** Whether a shopper buys is random. To keep luck out of the ranking, the score uses each shopper's *probability* of buying, given the 10 products you showed, as computed by the simulator's hidden model, instead of the coin flip. Your feedback shows the realised clicks and purchases; over many requests the two agree, so maximise real purchases and the score follows. And real purchases still feed the model a little: a shopper who already bought a product tends not to want it again, so what your system sells changes later scores.
+- **Claude Code** was the main tool (46 commits carry its co-author line), and **Codex** agents were used on
+  Saturday for parallel side tasks (live evaluator, cold-start and trend analyses, the report script).
+  TODO: confirm who used what.
+- **[`CLAUDE.md`](CLAUDE.md) is the team's shared memory.** Every agent session starts by reading it: repo
+  structure, rules (one production instance, casts on `Dynamic` columns, evaluate before deploying), the version
+  table and every finding with its number. When someone learned something (repurchase is penalised live; which
+  offline test to trust), it went there, and the next person's agent started from it.
+- **Rules that kept agents safe around production:** one production instance for the whole team and `make dry`
+  for everything else, `SELECT`-only analysis, and each model in its own branch until it wins an A/B.
+- **What agents were best at:** exploring the data with SQL, building the feature pipeline twice-consistent
+  (train/serve parity), reliability review (`tests/RELIABILITY.md`), and analysis on demand during the event.
+- **What stayed with us:** which hypothesis to test next, reading A/B results with their error bars, and every
+  decision to change production.
 
-### 30 points · Presentation (jury)
+## Team
 
-On Sunday afternoon each team gives a **short presentation with a demo** to the jury. The top teams share their repository, so keep it readable.
+TODO: one line per person (the sponsors ask for this explicitly).
 
-| Criterion | Points | What we look at |
-|---|---|---|
-| Method | 10 | Is the approach sound and well justified? How was it validated offline before going live? |
-| Learning from the stream | 10 | How did the system use feedback and live events (exploration, trends, price changes, cold start)? |
-| Use of RawTree | 5 | Features computed in SQL, embeddings, how the pipeline reads and writes |
-| Communication | 5 | Could a product manager understand what the system does and why it works? |
-
-**Tie-breaker:** expected revenue per request in the final round.
-
-## Getting started
-
-1. **Get your credentials** at the RawTree stand when you register your team: a `TEAM_ID` (like `team_07`) and a `RAWTREE_API_KEY`. Copy `.env.example` to `.env` and fill them in.
-2. **Meet RawTree.** It is an analytics database for JSON: you insert JSON and query it with SQL, no schema needed. It was built to be used by agents, so let yours find its way:
-   - Docs for agents: <https://rawtree.com/llms.txt>
-   - API: `https://api.rawtree.com` (`POST /v1/query`, `POST /v1/tables/{table}?database=team_NN`), auth with `Authorization: Bearer $RAWTREE_API_KEY`
-   - CLI: `curl -fsSL https://rawtree.com/install.sh | bash`, then `rtree query --api-key $RAWTREE_API_KEY --database $TEAM_ID "SELECT count() FROM shop.requests"`
-   - MCP: `https://mcp.rawtree.com/mcp`, sending your key as an `Authorization: Bearer` header
-
-   Tables are schemaless: every column is `Dynamic`, each value keeps its own type. Filters and most functions just work; join keys and a few aggregates need a cast, like `product_id::String`.
-3. **Get on the leaderboard in 30 minutes:** run the baseline.
-
-   ```bash
-   pip install -r starter/requirements.txt
-   python starter/recommender.py
-   ```
-
-   Or, without installing anything globally:
-
-   ```bash
-   uv run --with requests python starter/recommender.py
-   ```
-
-   The live stream opens on **Saturday at 10:00 CET**. Until then `shop.requests`, `shop.events` and `shop.catalog_updates` are empty, so queries on them fail with *Unknown expression identifier* and the baseline just retries. Explore the history meanwhile.
-
-4. **Beat it.** Explore the history, evaluate ideas offline (`starter/offline_eval.ipynb`), deploy, read your feedback, repeat.
-
-## Starter kit
-
-| File | What it is |
+| Member | What they did |
 |---|---|
-| `starter/recommender.py` | The baseline, about 120 lines, as a `pull → predict → push` loop: `recommend()` is the part to replace |
-| `starter/queries.sql` | SQL examples: current catalogue, popularity per category in the last hour, co-views, reading your feedback, your on-time rate |
-| `starter/offline_eval.ipynb` | Offline evaluation on `shop.history_sessions` — imports `recommender.py`, so it tests the same code that runs live; includes an inverse-propensity estimate of a new policy's click rate |
+| TODO | |
+| TODO | |
+| TODO | |
+| TODO | |
 
-To open the notebook without installing anything globally:
+## Run it
+
+Requires Python 3.12 and a `.env` with `TEAM_ID` and `RAWTREE_API_KEY` (copy `.env.example`; never commit it).
 
 ```bash
-pipx run $(sed 's/^/--with /' starter/requirements.txt | tr '\n' ' ') jupyter notebook starter/offline_eval.ipynb
+make install                 # virtualenv + dependencies
+make check                   # connection and table sizes
+python scripts/bird_v5.py state        # download the serving state (~2 min)
+make dry POLICY=v7-bird      # answer live requests without writing them
+make up POLICY=v7-bird       # production, supervised (only ONE instance per team)
+make up AB=v6-bird=v6-bird,v7-bird=v7-bird   # simultaneous A/B
+make monitor                 # conversion, on-time rate and latency per version, last 30 min
+make offline C="bird_v5"     # offline tests checked against the leaderboard
 ```
 
-## Rules
+## Repository map
 
-- All shoppers, sessions and outcomes are generated by a simulator with a secret seed. The catalogue is synthetic; no public dataset is used for scoring.
-- Feedback is private to each team. **Do not share keys.**
-- Recommendations must be produced by code, not by hand. The top teams share their repository with the jury.
-- Your system has to run unattended: keep it running on a machine that will not go to sleep.
-- Anything a team cannot explain in the presentation may be penalised.
-
-Questions? Find the RawTree team at the stand. Good luck!
+| Path | What |
+|---|---|
+| `reco/serve.py` | Live loop: pull → recommend → finalize → push; A/B assignment |
+| `reco/policies/` | One class per strategy (`fit`, `refresh`, `recommend`); registered in `__init__.py` |
+| `reco/bird/` | The Bird models: dataset builders, feature formulas (`feat5.py`), live state (`live5.py`), training |
+| `reco/safety.py` | `finalize()`: the last guard before every answer |
+| `reco/offline_live.py`, `scripts/offline_vs_live.py` | Offline tests and their reliability against the leaderboard |
+| `scripts/bird_v5.py` | Dataset, training, parity and comparison commands for the final model |
+| `scripts/supervise.py` | Supervisor: single instance, automatic restart |
+| `tests/` | Unit tests (feature invariance, A/B hashing, reliability regressions) |
+| `docs/` | Feature documentation, architecture, experiments, demo script |
+| `starter/` | The organisers' starter kit, untouched |

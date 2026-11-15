@@ -1,6 +1,6 @@
 # RawTree · Datathon FME 2026 (equipo DreamTeam)
 
-Reto: recomendar 10 productos por petición en < 3 s. Enunciado completo en `README.md`.
+Reto: recomendar 10 productos por petición en < 3 s. Enunciado completo en `ENUNCIADO.md` (el `README.md` es el nuestro).
 Ronda que puntúa: **domingo 15/11, 10:00–12:00 CET**. La mejor versión debe estar corriendo antes de las 10:00.
 
 ## Estructura

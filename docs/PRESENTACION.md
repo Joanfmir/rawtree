@@ -1,119 +1,202 @@
-# Guion para el jurado · team_17
+# Guion de la demo · DreamTeam (team_17)
 
-Duración prevista: seis minutos, más preguntas. Público: producto. Antes de presentar, ejecutar `python scripts/report.py`, revisar [las cifras actualizadas](figs/resumen.md) y sustituir los PENDIENTE. Las imágenes y CSV conservan denominadores y periodo; `figs/consultas.sql` conserva las consultas ejecutadas. No confundir la foto de práctica con el resultado final.
+Seis minutos más preguntas. Los sponsors han pedido **el cómo y el porqué, no el qué**: por qué hicimos cada
+cosa, cómo entrenamos, qué agentes de código usamos y qué hizo cada persona. Por eso el guion va por decisiones
+y no por componentes. Cada bloque sigue el mismo patrón: **qué vimos → qué decidimos → qué pasó**.
 
-## 0:00–0:45 · El problema de negocio
+Antes de presentar hay que rellenar los tres PENDIENTE: resultado final, reparto del equipo y qué era la
+versión `mj`.
 
-«Un cliente llega a una tienda y debemos elegir qué diez productos enseñarle, en menos de tres segundos. Queremos vender más, pero una gran recomendación que llega tarde no sirve: el cliente recibe el escaparate genérico. Por eso diseñamos juntos la relevancia y la fiabilidad.»
+| Criterio del jurado | Puntos | Dónde se responde |
+|---|---|---|
+| Método (justificado y validado offline) | 10 | Bloques 2 y 3 |
+| Aprender del stream | 10 | Bloques 4 y 5 |
+| Uso de RawTree | 5 | Bloques 4 y 7 (demo) |
+| Comunicación | 5 | Una idea por bloque, sin jerga |
+| Petición de los sponsors: agentes y reparto | — | Bloque 6 |
 
-Mostrar el reto en una frase: **entender la intención de esta visita y responder a tiempo**. Fuente de diez productos y tres segundos: `README.md`, reglas de entrega. La ronda que puntúa es domingo 15/11, 10:00–12:00 CET (`README.md`, calendario). El resultado oficial de esa ronda: **PENDIENTE**.
+---
 
-## 0:45–1:35 · Partimos de datos, pero desconfiamos de sus sesgos
+## 1 · El problema y el resultado (0:00–0:30)
 
-«Comenzamos con el histórico. Separamos entrenamiento y evaluación por fecha, para no validar con información del futuro. El escaparate anterior enseñaba sobre todo productos populares; acertar sobre ese registro puede premiar imitarlo. Por eso miramos también métricas que corrigen la probabilidad con que se mostró cada producto.»
+«Cada tercio de segundo llega un cliente y tenemos tres segundos para elegir los diez productos que verá.
+Empezamos el sábado vendiendo 0,74 de cada 100 visitas con los más vendidos. Acabamos en torno a 2,2. Os
+contamos las cinco decisiones que explican ese salto, incluida una idea que descartamos.»
 
-Resultado offline documentado: con corte 07/11 y 3.530 compras, `ips_hit` pasa de 0,080 con baseline a 0,340 con personal ajustada; `ips_ndcg` de personal es 0,198. Fuente: `CLAUDE.md`, «Resultados offline». Son resultados documentados, no recalculados por este informe; **no equivalen a conversión en vivo**.
+- Resultado de la ronda final: **PENDIENTE (sale a las 12:00)**.
+- Práctica, últimas tres horas: 5.º–6.º de 42 equipos, 2,13 compras esperadas por 100 peticiones.
 
-«Una advertencia: el histórico sugería mucha recompra. No la tratamos como una verdad del cliente futuro. La contrastamos con el feedback real y mantenemos políticas con decisiones diferentes sobre ese punto.» La señal histórica de 62 % de compras repetidas y 6,5 veces más probabilidad consta en `CLAUDE.md`; no afirmar que se mantiene en vivo. `README.md` advierte que una compra puede reducir el interés posterior.
+Enseñar la curva de versiones (tabla del bloque 5).
 
-## 1:35–2:30 · Lo que nos enseñó el stream
+## 2 · Decisión 1: no recomendar lo que el cliente ya compró (0:30–1:20)
 
-Mostrar [relación con vistas](figs/relacion_vistas.png) y [posición](figs/posicion.png).
+**Qué vimos.** En el histórico, el 62 % de las compras repiten un producto ya comprado, y uno ya comprado se
+compra 6,5 veces más. Nuestra primera política personalizada lo explotaba y ganaba todas las métricas offline.
 
-«Ahora podemos observar qué productos se mostraron de verdad y si hubo clic o compra. Separamos tres casos: el propio producto visto, otro de una categoría vista, y otra categoría. Las cifras actuales están en pantalla con el número de impresiones. Esta evidencia nos llevó a priorizar la intención de la sesión y a probar el filtro de categoría.»
+**Qué pasó en vivo.** Lo contrario: en nuestro feedback, un producto ya comprado convertía unas 9 veces menos.
 
-Leer las tasas exactas de `figs/resumen.md`, sección «Relación con vistas»; fuente: SELECT de `feedback`, `requests`, `catalog` y `catalog_updates`. Evitar un multiplicador fijo que pueda quedarse obsoleto. Los tres grupos son excluyentes, y las sesiones sin vistas se excluyen de esa comparación.
+**Qué decidimos.** Ninguna versión desde `v2-bird` propone algo ya comprado, y los tests offline excluyen las
+recompras.
 
-«También vemos que las posiciones no tienen el mismo rendimiento. Ordenar es parte de la recomendación. Pero estos gráficos son asociaciones: los mejores candidatos ya se colocan arriba, por lo que no atribuímos toda la diferencia a la posición.» Fuente: `figs/posicion.csv`.
+Frase para el jurado: «El histórico describe a los clientes del sistema viejo; el simulador es otro cliente.
+Aprendimos pronto a no fiarnos del histórico sin contrastarlo».
 
-## 2:30–3:30 · Cómo decide el sistema
+## 3 · Decisión 2: validar la validación (1:20–2:20)
 
-Mostrar [arquitectura](ARQUITECTURA.md).
+**Qué vimos.** Después de lo anterior no sabíamos qué número offline creer.
 
-«Primero reunimos candidatos: lo que acaba de mirar, productos relacionados, preferencias conocidas y productos populares en su contexto. Después los ordenamos. Comparamos una política de señales ponderadas con una variante centrada en la categoría y con un modelo LightGBM que aprende a ordenar.»
+**Qué decidimos.** Cogimos las 8 versiones que ya habíamos servido, con su conversión real en el leaderboard,
+y pedimos a cada test offline que las ordenara.
 
-«Para alguien nuevo usamos la sesión y el contexto, sin exigir un historial personal. Para un producto nuevo, el ranker puede usar categoría, precio y señales de sesión; sus estadísticas de popularidad parten de valores de su subcategoría. Así no necesita esperar a acumular compras para ser candidato.» Fuentes de implementación: `reco/policies/personal.py`, `reco/ranker.py`.
+| Test offline · métrica | Correlación con el leaderboard | Parejas bien ordenadas |
+|---|---|---|
+| **Orgánico · `ndcg@10`** | **0,98** | **27 de 28** |
+| Histórico · `ips_ndcg` sin recompras | 0,95 | 26 de 28 |
+| Histórico · `ips_ndcg` con recompras | −0,14 | 12 de 28 |
+| Histórico · `hit@10` con recompras | −0,60 | 8 de 28 |
 
-«Antes de enviar, una última barrera elimina duplicados, productos inactivos y agotados, y completa la lista con productos válidos. Si el catálogo no tuviera oferta suficiente, esta barrera no puede fabricar productos: seguimos midiendo la fiabilidad en feedback.» Fuente: `reco/safety.py`.
+**Qué pasó.** La métrica con la que empezamos ordenaba nuestras versiones al revés. El test de referencia pasó
+a ser el **orgánico**: peticiones reales del stream, y el acierto es lo que ese usuario compró por su cuenta en
+los 30 minutos siguientes. `make offline C="<política>"` lo ejecuta y da un veredicto: peor → descartar,
+empate → solo el vivo decide, mejor → A/B.
 
-## 3:30–4:35 · Cómo aprendemos y para qué usamos RawTree
+Es la respuesta directa a «¿cómo lo validasteis offline antes de salir en vivo?».
 
-Mostrar [reparto de versiones](figs/versiones.png).
+## 4 · Decisiones 3 y 4: cómo entrenamos (2:20–3:40)
 
-«Asignamos las peticiones entre brazos mediante un hash estable del identificador. Así podemos comparar alternativas simultáneamente sobre tráfico comparable. Medimos compras y clics, y revisamos tamaños de muestra antes de decidir. Un periodo anterior contra uno posterior no es un experimento controlado.» Fuente de asignación: `reco/serve.py`. Un mismo usuario puede aparecer en varios brazos: no prometemos independencia perfecta ni significación por el simple hecho de tener una tasa mayor.
+**Qué vimos antes de tocar el modelo** (`docs/DATASET_V5.md`, sección 1):
 
-«RawTree es el centro de datos operativos: leemos peticiones, catálogo, actividad orgánica y feedback; agregamos señales con SQL; conservamos los derivados en Parquet para servir desde memoria; y el servicio escribe la lista elegida por lotes. Actualizamos señales del stream sin poner el trabajo pesado dentro de cada recomendación.» Fuentes: `reco/features.py`, `reco/client.py`, `reco/serve.py`.
+- El vivo tiene unas 29 veces más eventos por hora que el histórico: un recuento no significa lo mismo al
+  entrenar que al servir.
+- En el histórico no hay ni un cambio de precio; en vivo hay promociones de dos horas, con un 42 % más de
+  conversión en nuestro carrusel.
+- Entran 100 productos nuevos cada cuatro horas y venden desde el primer minuto.
 
-«Actualizar las señales no es reentrenar el modelo. El feedback incorpora compras a la personalización y las exclusiones; los eventos actualizan popularidad y tendencias; el stock y el catálogo se refrescan. El entrenamiento de LightGBM se ejecuta por separado. No hemos implementado una asignación automática de tráfico al brazo ganador.»
+**Qué decidimos.**
 
-## 4:35–5:30 · Resultados y fiabilidad
+- **Features que valen igual en los dos mundos**: 81, ninguna es un recuento absoluto (cuotas, cocientes y lifts
+  suavizados). Un test lo comprueba.
+- **Una sola implementación de cada fórmula** para entrenar y para servir, con una comprobación de paridad valor
+  a valor.
+- **Nuestro feedback como dato de entrenamiento**, con peso triple: es la única medida directa del simulador.
+  Dos features salen de ahí: clics y compras de cada producto en nuestro carrusel, corregidos por la posición.
+- **Cold start desde el entrenamiento**: en el 30 % de las peticiones del histórico se esconde la historia del
+  usuario, y los productos nuevos heredan las tasas de su subcategoría.
 
-Mostrar [conversión y CTR](figs/conversion_ctr.png) y [latencia](figs/latencia.png).
+**El modelo.** CatBoost que estima la probabilidad de compra de cada producto para esta visita; puntúa todo el
+catálogo en stock y devuelve los diez mejores. Lo entrenamos tres veces según llegaba feedback: sábado por la
+noche, domingo de madrugada y domingo a las 10:00 con todo el vivo acumulado.
 
-«Esta es la evolución observada en ventanas de quince minutos, con el número de peticiones de cada brazo. Mostramos también el fallback. No asignamos una venta a una versión solo porque envió una respuesta: comprobamos que su lista ordenada coincide con lo que el simulador mostró.»
+## 5 · Decisión 5: solo sube a producción lo que gana un A/B simultáneo (3:40–4:40)
 
-Leer cifras vigentes de `figs/resumen.md`: periodo, peticiones, compras, CTR, conversión, porcentaje válido y a tiempo. Los percentiles de latencia se calculan sobre respuestas `team`; el porcentaje a tiempo incluye todo el feedback, también fallos. Las ventanas de los extremos pueden estar incompletas.
+**Por qué.** Las tendencias y el stock cambian durante el día: comparar una versión de las 15:00 con otra de las
+18:00 no dice nada. Repartimos las peticiones por un hash del identificador y cada brazo firma con su versión.
 
-«El feedback contiene compras realizadas. El ranking oficial utiliza probabilidades esperadas del simulador: nuestras tasas son un diagnóstico, no una reproducción exacta de su score.» Fuente: `README.md`, «No luck».
+**La idea que descartamos.** `v8-bird` añadía compras orgánicas al entrenamiento. Offline empataba. Tres horas
+con cuatro brazos a partes iguales:
 
-**Resultado final, cold start oficial y comparación con referencia/oráculo: PENDIENTE.** No declarar un ganador global usando tasas de versiones que se ejecutaron en horarios diferentes. Ganador A/B y su incertidumbre durante un periodo simultáneo: **PENDIENTE de análisis específico**.
+| Versión | Peticiones | Compras por 100 peticiones |
+|---|---|---|
+| v7-bird | 7.764 | 2,29 ± 0,17 |
+| v5-bird | 7.883 | 2,21 ± 0,17 |
+| v6-bird | 7.724 | 2,20 ± 0,17 |
+| v8-bird | 7.866 | 1,92 ± 0,15 |
 
-## 5:30–6:00 · Siguiente paso y demo
+«v5, v6 y v7 son indistinguibles; v8 fue la última las tres horas y no entró en la final. También miramos qué
+hacía cada una con los productos nuevos: v7 enseñaba los de una tanda recién llegada unas tres veces antes que
+v5 y v6, y v8 casi los ignoraba.»
 
-«Lo siguiente sería confirmar los brazos en un periodo simultáneo, medir por separado clientes y productos nuevos, y decidir cuánto explorar sin perder ventas. También mediríamos la frescura de las señales y el coste de refrescarlas. El objetivo es adaptar el escaparate manteniendo el plazo de respuesta.»
+**Evolución en vivo** (compras reales por 100 peticiones mientras cada versión estuvo activa):
 
-Demo segura: enseñar los PNG, `figs/resumen.md` y el diagrama. Para actualizar en directo, ejecutar únicamente `python scripts/report.py`. No arrancar otro servicio. Cierre: «La principal lección es que la intención actual del cliente y la operación fiable deben validarse con el stream, no darse por resueltas por el histórico».
+| Versión | Sábado/domingo (CET) | Conversión |
+|---|---|---|
+| baseline | sáb 12:24 | 0,74 |
+| Leattner.v1 → v3 (señales ponderadas) | sáb 13:27–17:19 | 1,04 → 1,45 |
+| v2-bird sin recompra (CatBoost, 56 features) | sáb 18:00–22:31 | 1,62 |
+| v3-bird (heurística + ranking) | sáb 19:30–23:09 | 1,53 |
+| v5/v6/v7-bird (81 features + feedback) | dom 01:20–10:23 | 1,94–2,30 |
+| Ronda final (`mj`) | dom 10:24– | **PENDIENTE** |
+
+Avisar de que son horas distintas y no comparables una a una; las decisiones se tomaron con los A/B.
+
+## 6 · Cómo trabajamos: agentes y equipo (4:40–5:30)
+
+**Agentes de código.**
+
+- Claude Code fue la herramienta principal (46 commits llevan su co-autoría) y usamos agentes de Codex el sábado
+  para tareas en paralelo (evaluador en vivo, análisis de cold start y tendencias, informe).
+  **PENDIENTE: confirmar quién usó qué.**
+- **`CLAUDE.md` como memoria compartida del equipo.** Cada sesión de agente empieza leyéndolo: estructura,
+  reglas, tabla de versiones y cada hallazgo con su número. Cuando alguien aprendía algo (la recompra penaliza,
+  qué test offline creer), lo escribía ahí y el agente del siguiente partía de eso.
+- **Reglas para trabajar cerca de producción:** una sola instancia para todo el equipo y `make dry` para probar;
+  análisis solo con `SELECT`; cada modelo en su rama hasta ganar un A/B.
+- **Qué hicieron bien los agentes:** explorar los datos con SQL, mantener iguales las features de entrenar y
+  servir, la revisión de fiabilidad y los análisis durante la ronda.
+- **Qué nos quedamos nosotros:** qué hipótesis probar, leer los A/B con su margen de error y cada cambio de
+  producción.
+
+**Quién hizo qué. PENDIENTE: una línea por persona.**
+
+| Persona | Qué hizo |
+|---|---|
+| PENDIENTE | |
+| PENDIENTE | |
+| PENDIENTE | |
+| PENDIENTE | |
+
+## 7 · Demo (5:30–6:00)
+
+Una sola cosa en pantalla: **el A/B es una consulta**. Ejecutar `make monitor`, que une
+`team_17.submissions` (qué versión respondió) con `team_17.feedback` (qué pasó) y enseña conversión, respuestas
+a tiempo y latencia por versión. Con eso se ve RawTree, el feedback y cómo decidimos, todo a la vez.
+
+Plan B si no hay red: la tabla del bloque 5 y el diagrama del `README.md`.
+
+No arrancar ningún servicio durante la demo.
+
+Cierre: «El modelo es la parte menos original. Lo que nos hizo subir fue comprobar cada creencia contra el
+stream: la recompra, la métrica offline y cada versión nueva».
+
+---
 
 ## Preguntas probables
 
-**¿Habéis ganado al baseline?** El offline documentado mejora `ips_hit`; la comparación en vivo se lee en los resultados actualizados y debe limitarse a periodos comparables. La mejora oficial final sigue PENDIENTE.
+**¿Por qué CatBoost y no algo más complejo?** Trata bien las categóricas (marca, categoría, atributos) sin
+fugas y nos permitió reentrenar con feedback nuevo durante el evento. Probamos dos variantes en dos etapas: v3
+perdió en vivo frente a v2 y v4 no llegó a servirse.
 
-**¿Por qué no recomendar siempre lo más vendido?** Es un respaldo robusto, pero no representa necesariamente la intención de esta sesión. La relación entre vistas y compras se muestra con denominadores en el informe.
+**¿Aprende solo?** Las señales sí: popularidad y tendencias en tramos de 10 minutos, historia de cada usuario
+al minuto, catálogo y stock. El modelo se reentrena a mano y los cambios de versión los decide el equipo; no
+hay un bandido automático.
 
-**¿Cómo evitáis el sesgo del histórico?** Corte temporal e indicadores ponderados por propensión. Eso no elimina todo el cambio de distribución; por eso usamos feedback y experimentos simultáneos. No afirmamos haber calculado una estimación causal sin restricciones.
+**¿Cómo tratáis a un cliente nuevo?** El 97 % de los marcados como nuevos ya tienen actividad de hoy antes de
+la petición, y la usamos. Para los que no tienen nada quedan el dispositivo, la región y la página. En práctica,
+con usuarios nuevos las cuatro versiones convertían igual (2,9–3,0 %).
 
-**¿Qué aprende automáticamente?** Se refrescan features y estado; se incorporan compras. No hay reentrenamiento continuo de LightGBM ni bandido adaptativo implementado. Los cambios de política los decide el equipo.
+**¿Y un producto nuevo?** Hereda las tasas de su subcategoría y tiene una feature de tendencia de la última
+hora. En nuestro carrusel los productos nuevos convertían 2,6 veces más que el resto.
 
-**¿Cómo tratáis el cold start?** Sesión, contexto, catálogo y valores por subcategoría para productos nuevos. La métrica oficial incluye usuarios nuevos o vistas de productos añadidos durante el evento (`README.md`). El desglose cuantitativo oficial sigue PENDIENTE.
+**¿Y los precios?** Usamos el precio en el instante de la petición y el descuento activo. No optimizamos
+ingresos, solo conversión.
 
-**¿Y los precios?** Se aplican actualizaciones del catálogo; el ranker usa precio y su relación con el perfil. No afirmamos disponer de un experimento causal sobre descuentos ni de un optimizador de promociones.
+**¿Cuánto tarda?** Mediana de 1,6 s y percentil 95 de 2,4 s sobre los 3 s permitidos, con el sondeo incluido.
+En práctica respondimos a tiempo el 97–98 % de las peticiones; con una sola versión en la final, el 99,7 %.
 
-**¿Por qué SQL y ficheros locales?** RawTree agrega los datos cerca de su origen; Parquet e índices en memoria permiten separar analítica de respuesta. El informe conserva SQL exacto para auditar las cifras.
+**¿Por qué guardáis cosas en local?** Nuestra clave solo permite `SELECT` e insertar JSON, así que lo derivado
+no puede vivir en RawTree: lo agregamos con SQL y lo guardamos en Parquet para servir desde memoria.
 
-**¿Por qué mostrar fallback?** También es una experiencia real del cliente. Excluirlo ocultaría fallos. En cambio, para comparar políticas distinguimos quién se sirvió realmente.
+**¿Qué haríais con más tiempo?** Reentreno automático con comprobación previa, medir cold start con un test
+propio (los nuestros no eran fiables para ese matiz) y bajar la latencia para ganar fiabilidad.
 
-**¿Una tasa mayor demuestra que el brazo gana?** No: hacen falta periodo simultáneo, muestra suficiente e incertidumbre; además puede haber dependencia entre peticiones del mismo usuario. Las figuras son descriptivas.
+**¿Qué salió mal?** Empezamos optimizando una métrica que ordenaba al revés; el sábado por la mañana perdimos
+un tramo entero en fallback; y mantuvimos cuatro brazos hasta entrada la ronda final.
 
-**¿Cómo sabemos que no se duplican resultados?** La atribución compara `items` con `feedback.shown` incluido el orden, y exige una etiqueta inequívoca. Una respuesta ambigua queda separada. Los duplicados de feedback se contabilizan y descartan por ID.
+## Fuentes de las cifras
 
-**¿Cuál es la limitación principal?** El histórico y el stream difieren; las compras son escasas y aleatorias, y la última ventana puede estar incompleta. Los resultados finales no pueden adelantarse a la ronda final.
-
-## Foto de práctica verificada (sustituir tras actualizar)
-
-Fuente de todas las cifras de este bloque: `figs/resumen.md`, intervalo UTC del 14/11 **10:36:49.934–13:05:36.592**, generado con consultas ejecutadas por `scripts/report.py`.
-
-- 26.781 peticiones, 716 clics y 223 compras: CTR **2,6735 %**, conversión **0,8327 %**.
-- Compra por impresión: recién visto **0,4089 %** (8.316 impresiones); categoría vista **0,2135 %** (44.956); otra categoría **0,0475 %** (162.078).
-- `Leattner.v1`: 51 compras / 4.562 peticiones, **1,1179 %**. Baseline: 85 / 11.257, **0,7551 %**. Son horarios distintos: no presentar esta diferencia como uplift causal.
-- Los brazos nuevos tienen solo 4 y 3 compras, respectivamente, en esta foto: insuficiente para declarar ganador.
-- Fiabilidad acumulada: **66,2410 %**, incluyendo un tramo inicial servido enteramente por fallback. No describe por sí sola el estado operativo actual. En la ventana parcial 13:00–13:05:36 UTC: **100 %** a tiempo sobre 1.010 peticiones; latencia team p50 **1.247 ms**, p95 **1.934,85 ms**.
-
-Para regenerar todo desde la raíz, con el Python autorizado:
-
-```bash
-/Users/joanfernandezmir/Desktop/DATA/rawtree/.venv/bin/python scripts/report.py
-```
-
-Para reproducir el intervalo de esta foto (el feedback disponible puede crecer por llegadas tardías):
-
-```bash
-/Users/joanfernandezmir/Desktop/DATA/rawtree/.venv/bin/python scripts/report.py --since '2026-11-14T10:36:49.934Z' --until '2026-11-14T13:05:36.592Z'
-```
-
-Para aislar la ronda final, cuando haya feedback disponible:
-
-```bash
-/Users/joanfernandezmir/Desktop/DATA/rawtree/.venv/bin/python scripts/report.py --since '2026-11-15T09:00:00Z' --until '2026-11-15T11:00:00Z'
-```
-
-El filtro usa hora de **feedback**, no hora de petición: este último comando es un diagnóstico aproximado de la ronda; para una auditoría exacta del score hay que filtrar por `shop.requests.ts` y esperar todo el feedback. Los comandos sobrescriben los artefactos anteriores.
+- Recompra, fiabilidad de los tests offline y nota de v8: `CLAUDE.md`.
+- Mediciones previas al dataset v5, filas y pesos de entrenamiento: `docs/DATASET_V5.md`.
+- A/B de cuatro brazos: leaderboard público (`/api/state?by=model`), 15/11 de 07:00 a 09:56 CET.
+- Evolución por versión, latencia y respuestas a tiempo: `team_17.feedback` unido a `team_17.submissions`,
+  consultado el 15/11 a las 10:40 CET. Es compra real, no la esperada que usa el leaderboard.
+- Productos nuevos por versión: análisis del 15/11 sobre las peticiones de 05:00 a 10:00 CET.
