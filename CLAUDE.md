@@ -42,7 +42,11 @@ y se añade a esta tabla y a `BIRD_VERSIONS` en `reco/policies/__init__.py`.
 
 El nombre de versión funciona como política: `make dry POLICY=v3-bird`, `make up AB=<otros brazos>,v3-bird=v3-bird`.
 Código en `reco/bird/` y `reco/policies/bird.py`; entrenamiento y evaluación con `scripts/bird.py` y
-`scripts/bird_blend.py`. La siguiente versión será **v7-bird**.
+`scripts/bird_blend.py`. La siguiente versión será **v8-bird**.
+
+v7-bird (`bird_v5_delta_r2`) es v6-bird con el modelo reentrenado `data/bird/v5_live2` (mismo dataset v5, más
+feedback en vivo). Reentrenar: `python scripts/bird_v5.py dataset --refresh-live --parts live` y
+`python scripts/bird_v5.py train --name v5_live2 --final`.
 
 v6-bird (`bird_v5_delta`) es v5-bird con la historia de los usuarios al minuto: mismo modelo y mismas features,
 más un delta con lo ocurrido desde la última descarga completa, que se pide en cada refresco (`live5.Delta`).

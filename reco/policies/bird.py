@@ -237,6 +237,17 @@ class BirdV5Delta(BirdV5):
     use_delta = True
 
 
+class BirdV5DeltaRetrained(BirdV5Delta):
+    """Política "bird_v5_delta_r2" (v7-bird): v6-bird con el modelo reentrenado (data/bird/v5_live2).
+
+    Mismas 81 features y mismo estado (base + delta); solo cambia el fichero del modelo, que se entrenó
+    con el histórico y TODO el feedback en vivo hasta la madrugada del 15/11, incluido el de v5-bird y
+    v6-bird. Si falta v5_live2 arranca con v5_fresh: comprobar la línea "[...] modelo ..." al arrancar.
+    """
+    name = "bird_v5_delta_r2"
+    final_name = "v5_live2"
+
+
 class _V5Hub:
     """Estado de servicio de v5 compartido entre brazos: una sola descarga, una sola copia en memoria.
 
