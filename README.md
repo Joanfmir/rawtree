@@ -3,7 +3,7 @@
 **Datathon FME 2026 · 14–15 November 2026 · UPC Barcelona**
 
 A shopper arrives every ~0.3 s. For each one we have 3 seconds to pick the 10 products they will see. This repo
-is the system we ran for 26 hours against the live stream: a CatBoost purchase model with 81 features computed
+is the system we ran for about 24 hours against the live stream: a CatBoost purchase model with 81 features computed
 in RawTree SQL, served from memory, retrained with our own live feedback, and chosen through simultaneous A/B
 tests.
 
@@ -11,9 +11,19 @@ tests.
 - Demo script: [`docs/PRESENTACION.md`](docs/PRESENTACION.md)
 - The 81 features, one by one, with the measurement that justifies each: [`docs/DATASET_V5.md`](docs/DATASET_V5.md)
 
-> **Result.** Final round (Sunday 10:00–12:00 CET): **TODO: position and score once published.**
-> Last three hours of practice: 5th–6th of 42 teams, 2.13 expected purchases per 100 requests (teams serving
-> only the baseline: ≈ 0.5).
+## Result
+
+**4th of 42 teams in the final round (Sunday 10:00–12:00 CET), with a score of 54.30 out of 100.**
+
+| Final round, 21,600 requests | DreamTeam | Baseline | Organisers' reference |
+|---|---|---|---|
+| Expected purchases per 100 requests | 2.14 | 0.75 | 2.14 |
+| The same on cold requests (new shopper or new product viewed) | 2.47 | 1.18 | 2.20 |
+| Answered validly and on time | 97.3 % | 100 % | 100 % |
+
+We sold almost three times as much as the best-seller baseline and matched the organisers' reference recommender,
+beating it on cold start. Reliability was our weakest component: the three teams above us answered more than
+99.9 % of requests on time.
 
 ---
 
@@ -85,7 +95,8 @@ compare them over the same window with standard errors.
 | v6-bird | 7,724 | 2.20 ± 0.17 |
 | v8-bird | 7,866 | 1.92 ± 0.15 |
 
-v5, v6 and v7 are indistinguishable; v8 was last in every hour and was left out of the final round.
+v5, v6 and v7 are indistinguishable; v8 was last in every hour. Twenty-four minutes into the final round we
+stopped the A/B and served a single version, the retrained v7.
 
 ---
 
@@ -131,7 +142,7 @@ Trained models are in `data/bird/<name>/` (`model.cbm`, `schema.json`, `metrics.
 | `v4-bird` | Two models: classifier selects 50, ranker with list features orders them | Not served live |
 | `v5-bird` | v2's model on dataset v5 (81 volume-invariant features, promotions, trends, own feedback) | ≈ 2.2. New production base |
 | `v6-bird` | v5 + per-user state up to the minute (delta) | Tie with v5 |
-| `v7-bird` | v6 retrained with more live feedback | Tie with v5 and v6. **Final-round model**: retrained with feedback up to 10:00 CET on Sunday and served alone from 10:24 CET (as `mj`; TODO: confirm) |
+| `v7-bird` | v6 retrained with more live feedback | Tie with v5 and v6. **Final-round model**: retrained with feedback up to 10:00 CET on Sunday and served alone from 10:24 CET under the label `mj` (2.23 over 16,957 final-round requests) |
 | `v8-bird` | v7 + organic purchases in training | 1.92. Lost the A/B, discarded |
 
 Last column: realised purchases per 100 requests in our own feedback while that version was live. Versions that
@@ -154,9 +165,8 @@ ran at different hours are not directly comparable; the decisions were taken on 
 
 Most of the code was written with coding agents, with us deciding what to try and what to believe.
 
-- **Claude Code** was the main tool (46 commits carry its co-author line), and **Codex** agents were used on
+- **Claude Code** was the main tool (most commits carry its co-author line), and **Codex** agents were used on
   Saturday for parallel side tasks (live evaluator, cold-start and trend analyses, the report script).
-  TODO: confirm who used what.
 - **[`CLAUDE.md`](CLAUDE.md) is the team's shared memory.** Every agent session starts by reading it: repo
   structure, rules (one production instance, casts on `Dynamic` columns, evaluate before deploying), the version
   table and every finding with its number. When someone learned something (repurchase is penalised live; which
