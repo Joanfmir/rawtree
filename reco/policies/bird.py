@@ -207,6 +207,7 @@ class BirdV5(BirdV2):
     final_name = "v5_live"    # histórico + feedback en vivo: el que se sirve
     state_script = "bird_v5.py"
     use_delta = False         # v6-bird (BirdV5Delta) lo activa
+    DELTA_EVERY = 600.0       # segundos entre dos descargas del delta de usuarios (v6-bird y derivadas)
     _hub = None               # estado en memoria compartido por todos los brazos v5 del proceso
 
     def _load_state(self, until):
@@ -214,7 +215,7 @@ class BirdV5(BirdV2):
         if until:                       # evaluación offline: estado propio, a fecha del corte
             return LiveState5.load(until)
         if BirdV5._hub is None:
-            BirdV5._hub = _V5Hub(LiveState5.load(None), self.STATE_EVERY, self.state_script)
+            BirdV5._hub = _V5Hub(LiveState5.load(None), self.STATE_EVERY, self.state_script, BirdV5.DELTA_EVERY)
         return BirdV5._hub.pick(self.use_delta)
 
     def _refresh_background(self) -> None:
@@ -228,7 +229,7 @@ class BirdV5Delta(BirdV5):
     """Política "bird_v5_delta" (v6-bird): v5-bird con la historia de los usuarios al minuto.
 
     Mismo modelo y mismas features. Lo único que cambia: además de la descarga completa de cada 30 min,
-    en cada refresco (2 min) se suma lo que cada usuario ha hecho desde entonces (reco/bird/live5.Delta), y
+    cada DELTA_EVERY s (10 min) se suma lo que cada usuario ha hecho desde entonces (reco/bird/live5.Delta), y
     lo que haya comprado en ese rato deja de ofrecérsele. Sirve sobre todo cuando entran compradores nuevos
     de golpe: hasta la siguiente descarga completa solo existen en el delta.
     En un A/B con v5-bird los dos brazos comparten la misma descarga: la diferencia es solo el delta.
@@ -254,15 +255,18 @@ class _V5Hub:
     plain   la descarga completa con catálogo, promociones y popularidad al día (lo que sirve v5-bird)
     delta   lo mismo + lo que han hecho los usuarios desde la descarga (lo que sirve v6-bird)
     Cada brazo llama a refresh() a su ritmo; si otro lo acaba de hacer (o lo está haciendo), no se repite.
+    Tres ritmos: producto en cada refresco (2 min), delta de usuarios cada `delta_every` s, descarga completa
+    cada `state_every` s. Entre dos descargas del delta se sigue usando el último (sobre el producto al día).
     """
 
-    def __init__(self, base, state_every: float, script: str) -> None:
+    def __init__(self, base, state_every: float, script: str, delta_every: float = 600.0) -> None:
         import threading
         import time
         self.lock = threading.Lock()
         self.base = self.plain = self.delta = base
-        self.state_every, self.script = state_every, script
+        self.state_every, self.script, self.delta_every = state_every, script, delta_every
         self.state_at, self.items_at = time.monotonic(), 0.0
+        self.delta_obj, self.delta_at = None, 0.0   # último delta descargado y cuándo
 
     def pick(self, use_delta: bool):
         return self.delta if use_delta else self.plain
@@ -298,14 +302,30 @@ class _V5Hub:
                     print(f"[{who}] refresco de producto lento: {time.time() - t:.0f}s")
             except Exception as e:
                 print(f"[{who}] refresco de producto falló, sigo con el anterior: {e}")
-            try:   # segunda capa: lo ocurrido desde el corte de la descarga
-                delta = base.with_delta()
-                d = delta.delta
-                if d is not None and d.seconds > 20:
-                    print(f"[{who}] delta de usuarios lento: {d.seconds:.0f}s ({d.events:,} eventos desde {d.t0})")
-            except Exception as e:
-                print(f"[{who}] delta de usuarios falló; este refresco v6-bird va sin delta: {e}")
+            # segunda capa: lo ocurrido desde el corte de la descarga. Se vuelve a pedir cada delta_every s,
+            # o antes si el que hay ya no vale (otra descarga completa u otro catálogo: va por índice de producto)
+            old = self.delta_obj
+            usable = (old is not None and old.t0 == base.t0 and len(old.ids) == len(base.ids)
+                      and bool((old.ids == base.ids).all()))
+            if not usable or time.monotonic() - self.delta_at >= self.delta_every:
+                try:
+                    delta = base.with_delta()
+                    d = delta.delta
+                    if d is not None:
+                        self.delta_obj, self.delta_at = d, time.monotonic()
+                        if d.seconds > 20:
+                            print(f"[{who}] delta de usuarios lento: {d.seconds:.0f}s ({d.events:,} eventos desde {d.t0})")
+                except Exception as e:
+                    print(f"[{who}] delta de usuarios falló: {e}")
+                    delta, usable = None, usable
+            else:
+                delta = None
+            if delta is None:   # no tocaba pedirlo (o falló): el último delta válido sobre el producto de ahora
                 delta = base
+                if usable:
+                    delta = object.__new__(LiveState5)
+                    delta.__dict__.update(base.__dict__)
+                    delta.delta = old
             self.base, self.plain, self.delta = base, base, delta
         finally:
             self.lock.release()
