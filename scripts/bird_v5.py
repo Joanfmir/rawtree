@@ -233,7 +233,7 @@ def cmd_state(args) -> None:
 
 def cmd_parity(args) -> None:
     from reco.bird import live5
-    live5.parity_report(args.until, minutes=args.minutes, n=args.n)
+    live5.parity_report(args.until, minutes=args.minutes, n=args.n, base=args.base, delta=not args.no_delta)
 
 
 def main() -> None:
@@ -276,6 +276,8 @@ def main() -> None:
     q.add_argument("--until", default="2026-11-14 20:00:00")
     q.add_argument("--minutes", type=float, default=5.0)
     q.add_argument("--n", type=int, default=300)
+    q.add_argument("--base", help="descarga completa anterior a --until; se le suma el delta hasta --until")
+    q.add_argument("--no-delta", action="store_true", help="con --base: sin delta (estado viejo, como antes)")
     q.set_defaults(fn=cmd_parity)
     args = ap.parse_args()
     args.fn(args)

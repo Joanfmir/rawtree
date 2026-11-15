@@ -290,6 +290,30 @@ def parse_views(items: Items, recent_views, now) -> tuple[np.ndarray, float]:
     return np.asarray(idx, dtype=np.int64), secs
 
 
+# ── usuario: base (descarga completa) + delta (lo ocurrido desde entonces) ──────────────────────────
+
+def combine_user_scalars(base: dict[str, float] | None, delta: dict[str, float] | None) -> dict[str, float]:
+    """Recuentos del usuario sumando las dos capas del estado de servicio.
+    `base`: u_events, u_buys, u_w, u_r, u_logp, u_buy_logp, u_logp_sd (medias, como las da el SQL).
+    `delta`: u_events, u_buys, u_w, u_r, s_logp, s_logp2, s_buy_logp (sumas, que sí se pueden sumar).
+    Las medias y la desviación se rehacen a partir de las sumas, así que el resultado es exacto."""
+    ev = buys = w = r = s = s2 = sb = 0.0
+    if base is not None:
+        n, m = float(base["u_events"]), float(np.nan_to_num(base["u_logp"]))
+        sd = float(np.nan_to_num(base["u_logp_sd"]))
+        ev, buys, w, r = n, float(base["u_buys"]), float(base["u_w"]), float(base["u_r"])
+        s, s2 = m * n, (sd * sd + m * m) * n
+        sb = float(np.nan_to_num(base["u_buy_logp"])) * buys
+    if delta is not None:
+        ev, buys = ev + float(delta["u_events"]), buys + float(delta["u_buys"])
+        w, r = w + float(delta["u_w"]), r + float(delta["u_r"])
+        s, s2, sb = s + float(delta["s_logp"]), s2 + float(delta["s_logp2"]), sb + float(delta["s_buy_logp"])
+    mean = s / ev if ev > 0 else np.nan
+    return {"u_events": ev, "u_buys": buys, "u_w": w, "u_r": r, "u_logp": mean,
+            "u_buy_logp": sb / buys if buys > 0 else np.nan,
+            "u_logp_sd": math.sqrt(max(s2 / ev - mean * mean, 0.0)) if ev > 0 else np.nan}
+
+
 # ── usuario: de recuentos a features ─────────────────────────────────────────────────────────────────
 
 def user_feats(a: dict[str, np.ndarray], logp: np.ndarray) -> dict[str, np.ndarray]:

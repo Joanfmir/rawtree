@@ -214,6 +214,14 @@ class BirdV5(BirdV2):
                 print(f"[{self.name}] refresco de producto lento: {time.time() - t:.0f}s")
         except Exception as e:
             print(f"[{self.name}] refresco de producto falló, sigo con el anterior: {e}")
+        try:   # lo que han hecho los usuarios desde la última descarga completa (segunda capa del estado)
+            live = self.live.with_delta()
+            self.live = live
+            d = live.delta
+            if d is not None and d.seconds > 20:
+                print(f"[{self.name}] delta de usuarios lento: {d.seconds:.0f}s ({d.events:,} eventos desde {d.t0})")
+        except Exception as e:
+            print(f"[{self.name}] delta de usuarios falló, sigo con el anterior: {e}")
 
 
 class BirdRank(BirdV2):

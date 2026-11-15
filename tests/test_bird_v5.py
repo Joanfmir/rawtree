@@ -132,6 +132,30 @@ class Feat5Test(unittest.TestCase):
         both = feat5.Items(pd.concat([cat, new], ignore_index=True).sort_values("product_id").reset_index(drop=True))
         np.testing.assert_allclose(both.price_vs_sub[:-1], self.items.price_vs_sub)   # un producto nuevo no la mueve
 
+    def test_base_mas_delta_es_exacto(self):
+        """Partir los eventos de un usuario en dos capas y sumarlas da lo mismo que tenerlos todos juntos."""
+        rng = np.random.default_rng(5)
+        logp, buy = rng.normal(3, 1, 40), rng.random(40) < 0.3
+        buy[[0, 39]] = True
+
+        def as_base(i):
+            return {"u_events": len(i), "u_buys": buy[i].sum(), "u_w": 2.0 * len(i), "u_r": 0.5 * len(i),
+                    "u_logp": logp[i].mean(), "u_buy_logp": logp[i][buy[i]].mean(), "u_logp_sd": logp[i].std()}
+
+        old, new, both = np.arange(25), np.arange(25, 40), np.arange(40)
+        delta = {"u_events": len(new), "u_buys": buy[new].sum(), "u_w": 2.0 * len(new), "u_r": 0.5 * len(new),
+                 "s_logp": logp[new].sum(), "s_logp2": (logp[new] ** 2).sum(), "s_buy_logp": logp[new][buy[new]].sum()}
+        got, want = feat5.combine_user_scalars(as_base(old), delta), as_base(both)
+        for k in want:
+            self.assertAlmostEqual(got[k], want[k], places=9, msg=k)
+        only = feat5.combine_user_scalars(None, delta)            # usuario que no estaba en la base
+        self.assertAlmostEqual(only["u_logp"], logp[new].mean(), places=9)
+        self.assertAlmostEqual(only["u_logp_sd"], logp[new].std(), places=9)
+        same = feat5.combine_user_scalars(as_base(old), None)     # sin delta: la base tal cual
+        for k, v in as_base(old).items():
+            self.assertAlmostEqual(same[k], v, places=9, msg=k)
+        self.assertTrue(np.isnan(feat5.combine_user_scalars(None, None)["u_logp"]))
+
     def test_parse_views(self):
         views = [{"product_id": "p_0002", "ts": "2026-11-14 16:01:40.000000000"},
                  {"product_id": "no_existe", "ts": "2026-11-14 16:01:50"},

@@ -95,6 +95,77 @@ def queries(until: str | None) -> dict[str, str]:
     }
 
 
+def delta_queries(t0: str, upto: str | None = None) -> dict[str, str]:
+    """Los mismos agregados por usuario que `queries`, pero solo de lo ocurrido desde `t0` (el corte de la
+    descarga completa): shop.events y los clics de nuestro carrusel. Son pocos eventos (como mucho los de
+    media hora), así que cada consulta tarda segundos y se repite en cada refresco.
+    El descuento temporal se expresa respecto a `t0`, igual que en la base: las dos capas se suman tal cual."""
+    hi = f" AND ts::DateTime64(3) < '{upto}'" if upto else ""
+    fhi = f" AND f.ts::DateTime64(3) < '{upto}'" if upto else ""
+    E = (f"(SELECT user_id::String AS user_id, product_id::String AS product_id, ts::DateTime64(3) AS ts, "
+         f"event_type::String AS kind, multiIf(event_type::String = 'purchase', 5, "
+         f"event_type::String = 'add_to_cart', 3, 1) AS w FROM shop.events "
+         f"WHERE ts::DateTime64(3) >= '{t0}'{hi} UNION ALL "
+         f"SELECT r.user_id::String, f.clicked::String, f.ts::DateTime64(3), "
+         f"if(f.purchased::String != '', 'c_purchase', 'c_click'), if(f.purchased::String != '', 5, 1) "
+         f"FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String "
+         f"WHERE f.clicked::String != '' AND f.request_id::String != '__init__' "
+         f"AND f.ts::DateTime64(3) >= '{t0}'{fhi})")
+    joined = f"{E} AS e INNER JOIN {catalog_sql(upto)} AS c ON c.product_id = e.product_id"
+    decay = f"exp(-dateDiff('millisecond', e.ts, toDateTime64('{t0}', 3)) / {feat5.TAU_MS:.1f})"
+    return {
+        "user": f"""SELECT e.user_id AS user_id, count() AS u_events, countIf(e.kind IN {BUY}) AS u_buys,
+                sum(e.w) AS u_w, sum(e.w * {decay}) AS u_r, sum(c.logp) AS s_logp,
+                sum(c.logp * c.logp) AS s_logp2, sumIf(c.logp, e.kind IN {BUY}) AS s_buy_logp
+            FROM {joined} GROUP BY user_id""",
+        "user_sub": f"""SELECT e.user_id AS user_id, c.subcategory AS k, sum(e.w) AS w, sum(e.w * {decay}) AS r,
+                countIf(e.kind IN {BUY}) AS buys FROM {joined} GROUP BY user_id, k""",
+        "user_brand": f"""SELECT e.user_id AS user_id, c.brand AS k, sum(e.w) AS w, countIf(e.kind IN {BUY}) AS buys
+            FROM {joined} GROUP BY user_id, k""",
+        "user_cat": f"""SELECT e.user_id AS user_id, c.category AS k, sum(e.w) AS w, sum(e.w * {decay}) AS r,
+                countIf(e.kind IN {BUY}) AS buys FROM {joined} GROUP BY user_id, k""",
+        "user_attr": f"""SELECT e.user_id AS user_id, arrayJoin(c.attrs) AS k, sum(e.w) AS w,
+                sum(e.w * {decay}) AS r, countIf(e.kind IN {BUY}) AS buys FROM {joined} GROUP BY user_id, k""",
+        "user_prod": f"""SELECT e.user_id AS user_id, e.product_id AS k, countIf(e.kind = 'view') AS views,
+                countIf(e.kind = 'add_to_cart') AS carts, countIf(e.kind = 'c_click') AS c_clicks,
+                countIf(e.kind IN {BUY}) AS buys, toString(max(e.ts)) AS last
+            FROM {joined} GROUP BY user_id, k""",
+    }
+
+
+_DELTA_COLS = {"user": ["user_id", "u_events", "u_buys", "u_w", "u_r", "s_logp", "s_logp2", "s_buy_logp"],
+               "user_sub": ["user_id", "k", "w", "r", "buys"], "user_brand": ["user_id", "k", "w", "buys"],
+               "user_cat": ["user_id", "k", "w", "r", "buys"], "user_attr": ["user_id", "k", "w", "r", "buys"],
+               "user_prod": ["user_id", "k", "views", "carts", "c_clicks", "buys", "last"]}
+
+
+class Delta:
+    """Lo que han hecho los usuarios desde el corte de la base, en el mismo formato que la base."""
+
+    @classmethod
+    def fetch(cls, t0: str, items: feat5.Items, upto: str | None = None) -> Delta:
+        t = time.time()
+        tables = {}
+        for name, sql in delta_queries(t0, upto).items():
+            df = pd.DataFrame(query(sql, timeout=60))
+            tables[name] = df if len(df) else pd.DataFrame({c: [] for c in _DELTA_COLS[name]})
+        self = cls()
+        self.t0, self.upto, self.ids = t0, upto, items.ids
+        user = tables["user"]
+        self.ucode = {u: i for i, u in enumerate(user.user_id)}
+        self.user_cols = {c: user[c].to_numpy(dtype=float) for c in _DELTA_COLS["user"][1:]}
+        self.by_sub = _ByUser(tables["user_sub"], self.ucode, items.codes["sub"], ["w", "r", "buys"])
+        self.by_brand = _ByUser(tables["user_brand"], self.ucode, items.codes["brand"], ["w", "buys"])
+        self.by_cat = _ByUser(tables["user_cat"], self.ucode, items.codes["cat"], ["w", "r", "buys"])
+        self.by_attr = _ByUser(tables["user_attr"], self.ucode, feat5.ATTR_CODE, ["w", "r", "buys"])
+        up = tables["user_prod"]
+        up["last"] = pd.to_datetime(up["last"]).to_numpy().astype("datetime64[ns]")
+        self.by_prod = _ByUser(up, self.ucode, items.idx, ["views", "carts", "c_clicks", "buys", "last"])
+        self.events = int(user.u_events.sum()) if len(user) else 0
+        self.seconds = time.time() - t
+        return self
+
+
 def _fetch(name: str, sql: str) -> pd.DataFrame:
     if name in CHUNKED:   # RawTree devuelve como mucho 100 MiB por consulta: se parte por hash de usuario
         return pd.concat([pd.DataFrame(query(sql.replace(
@@ -104,11 +175,18 @@ def _fetch(name: str, sql: str) -> pd.DataFrame:
 
 
 def download(until: str | None = None, verbose: bool = True, only: tuple[str, ...] | None = None) -> Path:
-    """Descarga las tablas y las deja en Parquet. Escribe en una carpeta temporal y la cambia al final."""
+    """Descarga las tablas y las deja en Parquet. Escribe en una carpeta temporal y la cambia al final.
+    En vivo se fija un corte (hace un minuto, por el reloj de RawTree) y todas las tablas se piden hasta
+    ese instante: es el `t0` desde el que después se pide el delta (cut.json)."""
+    import json
     out = folder(until)
     tmp = out.with_name(out.name + ".tmp")
     tmp.mkdir(parents=True, exist_ok=True)
-    for name, sql in queries(until).items():
+    cut = until
+    if until is None and not only:
+        cut = str(query("SELECT toString(now64(3) - INTERVAL 60 SECOND) AS t")[0]["t"])[:23]
+        (tmp / "cut.json").write_text(json.dumps({"t0": cut}))
+    for name, sql in queries(cut).items():
         if only and name not in only:
             continue
         t = time.time()
@@ -119,7 +197,7 @@ def download(until: str | None = None, verbose: bool = True, only: tuple[str, ..
         if verbose:
             print(f"  {name:<14} {len(df):>9,} filas  {time.time() - t:.1f}s")
     out.mkdir(parents=True, exist_ok=True)
-    for f in tmp.glob("*.parquet"):
+    for f in sorted(tmp.iterdir(), key=lambda p: p.suffix == ".json"):   # cut.json el último: marca la descarga completa
         f.replace(out / f.name)
     tmp.rmdir()
     return out
@@ -159,8 +237,14 @@ class LiveState5:
         if not (src / "user_prod.parquet").exists():
             download(until)
         read = lambda name: pd.read_parquet(src / f"{name}.parquet")   # noqa: E731
+        import json
         self = cls()
         self.until = until
+        # corte de la base: desde ahí se pide el delta. Sin cut.json (estado descargado con el código
+        # anterior) no hay delta y todo funciona como antes.
+        cut = src / "cut.json"
+        self.t0 = until if until else (json.loads(cut.read_text())["t0"] if cut.exists() else None)
+        self.delta = None
         self._static_ctx = {name: read(name) for name in ("item_shown", "item_clicked", "ctx_device", "ctx_region")}
         self._neighbors = read("item_neighbors")
         self._set_items(read("catalog"), read("item"), read("item_feedback"))
@@ -260,21 +344,40 @@ class LiveState5:
                 table = getattr(self, name)
                 where_k = np.array([new_codes.get(k, 0) for k in old_codes], dtype=np.int64)
                 setattr(new, name, table.remap(where_k))
+            new.delta = None   # el delta va por índice de producto: se vuelve a pedir con el catálogo nuevo
+        return new
+
+    def with_delta(self, upto: str | None = None) -> LiveState5:
+        """Copia con lo que han hecho los usuarios desde el corte de la base hasta ahora (o hasta `upto`,
+        para probar). 6 consultas pequeñas; la base no se toca."""
+        if not self.t0:
+            return self
+        new = object.__new__(LiveState5)
+        new.__dict__.update(self.__dict__)
+        new.delta = Delta.fetch(self.t0, self.items, upto)
         return new
 
     # ── por petición ─────────────────────────────────────────────────────────────────────────────────
 
-    def user(self, req) -> int | None:
-        """Código del usuario, o None si no tiene historia. A diferencia de v2 no se mira is_new_user: un
-        comprador nuevo que ya ha navegado hoy tiene historia y se usa."""
-        return self.ucode.get(req.get("user_id"))
+    def user(self, req) -> tuple[int | None, int | None] | None:
+        """(código en la base, código en el delta), o None si no tiene historia en ninguna de las dos.
+        A diferencia de v2 no se mira is_new_user: un comprador nuevo que ya ha navegado hoy tiene historia."""
+        uid = req.get("user_id")
+        u = self.ucode.get(uid)
+        du = self.delta.ucode.get(uid) if self.delta is not None else None
+        return None if u is None and du is None else (u, du)
 
-    def bought(self, u: int | None) -> np.ndarray:
-        """Índices de los productos que el usuario ya compró (para no volver a ofrecérselos)."""
-        if u is None:
+    def bought(self, who: tuple[int | None, int | None] | None) -> np.ndarray:
+        """Índices de los productos que el usuario ya compró (para no volver a ofrecérselos), contando
+        también lo comprado desde la última descarga completa."""
+        if who is None:
             return np.zeros(0, dtype=int)
-        r = self.by_prod.rows(u)
-        return self.by_prod.k[r][self.by_prod.v["buys"][r] > 0]
+        out = []
+        for table, u in ((self.by_prod, who[0]), (self.delta.by_prod if self.delta is not None else None, who[1])):
+            if table is not None and u is not None:
+                r = table.rows(u)
+                out.append(table.k[r][table.v["buys"][r] > 0])
+        return np.concatenate(out) if out else np.zeros(0, dtype=int)
 
     def features(self, req, schema) -> pd.DataFrame:
         out = self._columns(req, schema)
@@ -314,43 +417,58 @@ class LiveState5:
         out.update(feat5.session_block(it, views, secs, self.nb))
 
         # usuario
-        u = self.user(req)
+        who = self.user(req)
         agg = {k: z for k in feat5.USER_AGG}
         pair = {"up_views": z, "up_carts": z, "up_c_clicks": z, "up_days_since_seen": np.full(n, np.nan)}
         legacy = {"u_events": z, "u_buys": z, "u_sub_w": z, "u_brand_w": z, "u_sub_buys": z, "u_brand_buys": z}
-        if u is not None:
-            def spread(table: _ByUser, col: str, size: int) -> np.ndarray:
-                r = table.rows(u)
+        if who is not None:
+            u, du = who
+            layers = [(self, u)] + ([(self.delta, du)] if du is not None else [])
+
+            def spread(name: str, col: str, size: int) -> np.ndarray:
+                """Vector por clave sumando base y delta."""
                 vec = np.zeros(size + 1)                       # hueco extra: "sin clave"
-                vec[table.k[r]] = table.v[col][r]
+                for layer, code in layers:
+                    if code is not None:
+                        table = getattr(layer, name)
+                        r = table.rows(code)
+                        vec[table.k[r]] += table.v[col][r]
                 return vec
 
             n_sub, n_brand, n_cat = (len(it.codes[c]) for c in ("sub", "brand", "cat"))
             i1, i2 = np.where(it.a1 >= 0, it.a1, feat5.N_ATTR), np.where(it.a2 >= 0, it.a2, feat5.N_ATTR)
-            attr = {c: spread(self.by_attr, c, feat5.N_ATTR) for c in ("w", "r", "buys")}
-            agg = {k: np.full(n, v[u]) for k, v in self.user_cols.items()}
+            attr = {c: spread("by_attr", c, feat5.N_ATTR) for c in ("w", "r", "buys")}
+            scalars = feat5.combine_user_scalars(
+                {k: v[u] for k, v in self.user_cols.items()} if u is not None else None,
+                {k: v[du] for k, v in self.delta.user_cols.items()} if du is not None else None)
+            agg = {k: np.full(n, v) for k, v in scalars.items()}
             agg.update({
-                "u_sub_w": spread(self.by_sub, "w", n_sub)[it.sub], "u_brand_w": spread(self.by_brand, "w", n_brand)[it.brand],
-                "u_cat_w": spread(self.by_cat, "w", n_cat)[it.cat],
+                "u_sub_w": spread("by_sub", "w", n_sub)[it.sub], "u_brand_w": spread("by_brand", "w", n_brand)[it.brand],
+                "u_cat_w": spread("by_cat", "w", n_cat)[it.cat],
                 "u_attr_w1": attr["w"][i1], "u_attr_w2": attr["w"][i2],
-                "u_sub_r": spread(self.by_sub, "r", n_sub)[it.sub], "u_cat_r": spread(self.by_cat, "r", n_cat)[it.cat],
+                "u_sub_r": spread("by_sub", "r", n_sub)[it.sub], "u_cat_r": spread("by_cat", "r", n_cat)[it.cat],
                 "u_attr_r": attr["r"][i1] + attr["r"][i2],
-                "u_sub_buys": spread(self.by_sub, "buys", n_sub)[it.sub],
-                "u_brand_buys": spread(self.by_brand, "buys", n_brand)[it.brand],
-                "u_cat_buys": spread(self.by_cat, "buys", n_cat)[it.cat],
+                "u_sub_buys": spread("by_sub", "buys", n_sub)[it.sub],
+                "u_brand_buys": spread("by_brand", "buys", n_brand)[it.brand],
+                "u_cat_buys": spread("by_cat", "buys", n_cat)[it.cat],
                 "u_attr_buys": attr["buys"][i1] + attr["buys"][i2],
             })
-            r = self.by_prod.rows(u)
             last_seen = np.full(n, NEVER, dtype="datetime64[ns]")
-            last_seen[self.by_prod.k[r]] = self.by_prod.v["last"][r]
-            pair = {"up_views": spread(self.by_prod, "views", n)[:n], "up_carts": spread(self.by_prod, "carts", n)[:n],
-                    "up_c_clicks": spread(self.by_prod, "c_clicks", n)[:n],
-                    "up_days_since_seen": np.where(last_seen > NEVER, (now - last_seen) / np.timedelta64(1, "D"), np.nan)}
+            for layer, code in layers:
+                if code is not None:
+                    r = layer.by_prod.rows(code)
+                    k = layer.by_prod.k[r]
+                    last_seen[k] = np.maximum(last_seen[k], layer.by_prod.v["last"][r])
+            views, carts, clicks, buys = (spread("by_prod", c, n)[:n] for c in ("views", "carts", "c_clicks", "buys"))
+            kept = feat5.stored_pair(views, carts, clicks, buys)   # la misma regla que el dataset
+            pair = {"up_views": np.where(kept, views, 0.0), "up_carts": carts, "up_c_clicks": clicks,
+                    "up_days_since_seen": np.where(kept & (last_seen > NEVER),
+                                                   (now - last_seen) / np.timedelta64(1, "D"), np.nan)}
             legacy = {k: agg[k] for k in legacy}
         out.update(feat5.user_feats(agg, it.logp))
         out.update(pair)
         out.update(legacy)
-        out["is_new_user"] = np.full(n, 1.0 if (req.get("is_new_user") or u is None) else 0.0)
+        out["is_new_user"] = np.full(n, 1.0 if (req.get("is_new_user") or who is None) else 0.0)
         missing = [f for f in schema.features if f not in out]
         if missing:
             raise NotImplementedError(f"LiveState5 no calcula {missing} (esquema {schema.version})")
@@ -359,10 +477,13 @@ class LiveState5:
 
 # ── paridad entrenamiento ↔ servicio ─────────────────────────────────────────────────────────────────
 
-def parity_report(until: str, minutes: float = 5.0, n: int = 300, verbose: bool = True) -> pd.DataFrame:
+def parity_report(until: str, minutes: float = 5.0, n: int = 300, verbose: bool = True,
+                  base: str | None = None, delta: bool = True) -> pd.DataFrame:
     """Compara, para peticiones reales de los `minutes` siguientes a `until`, las features del dataset
     (calculadas al milisegundo) con las que daría el servicio con un estado descargado en `until`.
-    Deben coincidir salvo por lo que el usuario hizo entre `until` y la petición."""
+    Deben coincidir salvo por lo que el usuario hizo entre `until` y la petición.
+    Con `base` (anterior a `until`) se prueba el estado en dos capas: descarga completa en `base` + delta
+    de `base` a `until`; con delta=False, solo la descarga de `base` (lo que pasaba antes: estado viejo)."""
     import pickle
 
     from .build_v5 import OUT, RAW
@@ -372,7 +493,11 @@ def parity_report(until: str, minutes: float = 5.0, n: int = 300, verbose: bool 
     ds = ds[(ds.timestamp >= t0) & (ds.timestamp < t0 + pd.Timedelta(minutes=minutes))]
     sess = pickle.loads((RAW / "live_sessions.pkl").read_bytes()).set_index("request_id")
     ids = ds.request_id.drop_duplicates().head(n)
-    state = LiveState5.load(until)
+    state = LiveState5.load(base or until)
+    if base and delta:
+        state = state.with_delta(upto=until)
+        print(f"delta {base} → {until}: {state.delta.events:,} eventos de {len(state.delta.ucode):,} usuarios "
+              f"en {state.delta.seconds:.1f}s")
     rows = []
     for rid in ids:
         s = sess.loc[rid]
@@ -398,6 +523,11 @@ def parity_report(until: str, minutes: float = 5.0, n: int = 300, verbose: bool 
     out["corr"] = r.groupby("feature").apply(lambda g: g[["serve", "train"]].corr().iloc[0, 1], include_groups=False)
     out = out.sort_values("iguales")
     if verbose:
-        print(f"{len(ids)} peticiones entre {until} y +{minutes:g} min · estado descargado a fecha {until}")
-        print(out.to_string(float_format=lambda v: f"{v:.4f}"))
+        how = f"descarga de {base}" + (" + delta" if delta else " SIN delta") if base else f"descarga de {until}"
+        print(f"{len(ids)} peticiones entre {until} y +{minutes:g} min · estado: {how}")
+        user = [f for f in feat5.USER + feat5.AFFINITY + ("up_views", "up_carts", "up_c_clicks", "up_days_since_seen")
+                if f in out.index]
+        print(f"features de usuario (las que dependen del delta): {out.loc[user, 'iguales'].mean():.4f} de valores "
+              f"iguales, correlación media {out.loc[user, 'corr'].mean():.4f}")
+        print(out.loc[user].sort_values("iguales").to_string(float_format=lambda v: f"{v:.4f}"))
     return out
